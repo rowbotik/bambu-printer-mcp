@@ -9,7 +9,7 @@
 
 A Bambu Lab-focused MCP server for controlling Bambu printers, manipulating STL files, and managing end-to-end 3MF print workflows from Claude Desktop, Claude Code, or any MCP-compatible client.
 
-This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server). All OctoPrint, Klipper, Duet, Repetier, Prusa Connect, and Creality Cloud support has been removed. What remains is a focused, correct implementation for Bambu Lab hardware -- with two protocol-level bugs fixed that exist in the parent project.
+This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server). All OctoPrint, Klipper, Duet, Repetier, Prusa Connect, and Creality Cloud support has been removed. What remains is a focused, lean implementation for Bambu Lab hardware.
 
 <details>
 <summary><strong>Click to expand Table of Contents</strong></summary>
@@ -56,7 +56,7 @@ This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://gith
 
 **What this is not.** This package intentionally supports only Bambu Lab printers. It does not include adapters for OctoPrint, Klipper (Moonraker), Duet, Repetier, Prusa Connect, or Creality Cloud. If you need multi-printer support, use the parent project [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server) instead.
 
-**Why a separate package?** The parent project carries all printer adapters in a single binary. When working exclusively with Bambu hardware, that breadth adds noise and includes code paths with known Bambu-specific bugs. This fork strips the project to its Bambu core and applies two targeted protocol fixes described in [Bambu Communication Notes](#bambu-communication-notes-mqtt-and-ftp).
+**Why a separate package?** The parent project carries all printer adapters in a single binary. When working exclusively with Bambu hardware, that breadth adds unnecessary weight. This fork strips the project to its Bambu core for a smaller, faster install. Both packages share the same protocol fixes and safety features.
 
 **Note on resource usage.** STL manipulation loads entire mesh geometry into memory. For large or complex STL files (greater than 10 MB), these operations can be memory-intensive. See [General Limitations and Considerations](#general-limitations-and-considerations) for details.
 
@@ -464,7 +464,7 @@ Bambu Lab printers do not use a conventional REST API. Instead, they expose two 
 
 ### What this fork fixes
 
-The parent project (`mcp-3D-printer-server`) contains two Bambu-specific protocol bugs that this fork corrects.
+Both this package and the parent project (`mcp-3D-printer-server`) include fixes for two protocol-level issues in the underlying `bambu-js` library.
 
 **Bug 1: FTP double-path error in bambu-js.**
 
@@ -489,7 +489,7 @@ private async ftpUpload(host, token, localPath, remotePath): Promise<void> {
 
 **Bug 2: AMS mapping format in the project_file MQTT command.**
 
-The `bambu-js` library's project file command hardcodes `use_ams: true` and does not support the `ams_mapping` field at all. Separately, the parent project constructs the mapping as a simple array of slot indices (e.g., `[0, 2]`), which does not match the OpenBambuAPI specification.
+The `bambu-js` library's project file command hardcodes `use_ams: true` and does not support the `ams_mapping` field at all. Without the fix, the mapping is a simple array of slot indices (e.g., `[0, 2]`), which does not match the OpenBambuAPI specification.
 
 According to the OpenBambuAPI spec, `ams_mapping` must be a 5-element array where each position corresponds to a filament color slot in the print file. Unused positions must be padded with `-1`. For example, a print using only AMS slot 0 sends `[-1, -1, -1, -1, 0]`.
 
