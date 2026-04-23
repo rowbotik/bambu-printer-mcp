@@ -486,7 +486,11 @@ export class BambuImplementation {
       throw new Error("print3mf requires a .3mf input file.");
     }
 
-    const remoteFileName = path.basename(options.filePath);
+    // Normalise remote filename: collapse double-extension artifacts like
+    // "Cube.gcode.3mf.gcode.3mf" → "Cube.gcode.3mf" so firmware can identify
+    // the container format from the extension.
+    let remoteFileName = path.basename(options.filePath);
+    remoteFileName = remoteFileName.replace(/\.gcode\.3mf\.gcode\.3mf$/i, ".gcode.3mf");
     const remoteProjectPath = `cache/${remoteFileName}`;
 
     // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
