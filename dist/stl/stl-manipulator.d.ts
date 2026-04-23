@@ -50,6 +50,14 @@ export declare class STLManipulator extends EventEmitter {
      * Generate a unique operation ID
      */
     private generateOperationId;
+    private getAvailableProfileRoots;
+    private findProfileFile;
+    private buildFilamentIdIndex;
+    private readJsonFile;
+    private stripAbsoluteExtruderResets;
+    private sanitizeProcessForOrca;
+    private writeTempJson;
+    private resolveBambuLikeSettingsBundle;
     /**
      * Load STL file and return geometry and bounding box
      */

@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import JSZip from "jszip";
 import { Client as FTPClient } from "basic-ftp";
 import { BambuPrinter } from "bambu-js";
+import * as mqtt from "mqtt";
 import {
   BambuClient,
   GCodeFileCommand,
@@ -11,6 +14,42 @@ import {
   PushAllCommand,
   UpdateStateCommand,
 } from "bambu-node";
+
+/**
+ * Post-Jan-2025 H2D firmware requires mTLS with a Bambu-issued client cert.
+ * Loads cert+key once from:
+ *   - BAMBU_CLIENT_CERT / BAMBU_CLIENT_KEY env vars (paths), or
+ *   - ~/Desktop/bambu certs/embedded-cert.pem + embedded-key.pem (default)
+ * Returns null if files missing — caller falls back to no-cert TLS.
+ */
+function loadClientCreds(): { cert: Buffer; key: Buffer } | null {
+  const defaultDir = path.join(os.homedir(), "Desktop", "bambu certs");
+  const certPath = process.env.BAMBU_CLIENT_CERT || path.join(defaultDir, "embedded-cert.pem");
+  const keyPath = process.env.BAMBU_CLIENT_KEY || path.join(defaultDir, "embedded-key.pem");
+  try {
+    if (!existsSync(certPath) || !existsSync(keyPath)) return null;
+    return { cert: readFileSync(certPath), key: readFileSync(keyPath) };
+  } catch {
+    return null;
+  }
+}
+
+const CLIENT_CREDS = loadClientCreds();
+
+const COMMAND_SETTLE_MS = 300;
+
+const MODEL_ID_TO_NAME: Record<string, string> = {
+  O1D: "H2D",
+  O1E: "H2D Pro",
+  O1S: "H2S",
+  N2S: "A1",
+  A1M: "A1 Mini",
+  C11: "P1P",
+  C12: "P1S",
+  "BL-P001": "X1C",
+  "BL-P002": "X1",
+  C13: "X1E",
+};
 
 interface BambuPrintOptionsInternal {
   projectName: string;
@@ -33,12 +72,216 @@ interface ProjectFileMetadata {
   md5: string;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveModelName(data: Record<string, any>): string {
+  const modelId = `${data?.model_id ?? ""}`.toUpperCase();
+  return (
+    MODEL_ID_TO_NAME[modelId] ||
+    data?.model ||
+    data?.device?.devModel ||
+    data?.device?.dev_model ||
+    "Unknown"
+  );
+}
+
+async function invokeWithoutAck(printer: BambuClient, command: { invoke(client: BambuClient): Promise<void> }) {
+  await command.invoke(printer);
+  await sleep(COMMAND_SETTLE_MS);
+}
+
+function getPrinterKey(host: string, serial: string, token: string): string {
+  return `${host}-${serial}-${token}`;
+}
+
+class TolerantBambuClient extends BambuClient {
+  /**
+   * H2D-class firmware streams push status immediately after subscribe, but
+   * never answers bambu-node's initial get_version round-trip. Avoid treating
+   * that missing ACK as a failed connection.
+   */
+  protected override async onConnect(): Promise<void> {
+    const subscribe = (this as any).subscribe.bind(this);
+    await subscribe(`device/${this.config.serialNumber}/report`);
+  }
+
+  /**
+   * H2S/H2D printers don't respond to get_version with module info.
+   * Infer model from serial number prefix so downstream code (Job, status
+   * parsing, etc.) has a valid printerModel instead of undefined.
+   */
+  private inferModelFromSerial(): string | undefined {
+    const sn = this.config.serialNumber;
+    if (sn.startsWith("093")) return "H2S";
+    if (sn.startsWith("094")) return "H2D";
+    if (sn.startsWith("00M")) return "X1C";
+    if (sn.startsWith("00W")) return "X1";
+    if (sn.startsWith("03W")) return "X1E";
+    if (sn.startsWith("01S")) return "P1P";
+    if (sn.startsWith("01P")) return "P1S";
+    if (sn.startsWith("030")) return "A1";
+    if (sn.startsWith("039")) return "A1M";
+    return undefined;
+  }
+
+  /**
+   * Override bambu-node's MQTT connect to pass a client cert+key for mTLS.
+   * Post-Jan-2025 H2D firmware rejects TLS handshakes without a valid Bambu-
+   * issued client certificate. Options mirror the upstream implementation
+   * plus `cert`/`key` when creds are available.
+   */
+  override async connect(): Promise<[void]> {
+    await new Promise<void>((resolve, reject) => {
+      const self: any = this;
+      if (self.mqttClient) {
+        throw new Error("Can't establish a new connection while running another one!");
+      }
+      const tlsOpts: Record<string, unknown> = {
+        username: "bblp",
+        password: self.config.accessToken,
+        reconnectPeriod: self.clientOptions.reconnectInterval,
+        connectTimeout: self.clientOptions.connectTimeout,
+        keepalive: self.clientOptions.keepAlive,
+        resubscribe: true,
+        rejectUnauthorized: false,
+      };
+      if (CLIENT_CREDS) {
+        tlsOpts.cert = CLIENT_CREDS.cert;
+        tlsOpts.key = CLIENT_CREDS.key;
+      }
+      const client = mqtt.connect(
+        `mqtts://${self.config.host}:${self.config.port}`,
+        tlsOpts as any
+      );
+      self.mqttClient = client;
+      client.on("connect", async (...args: any[]) => {
+        try {
+          await self.onConnect(...args);
+          self.emit("client:connect");
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+      client.on("disconnect", () => {
+        self.emit("client:disconnect", false);
+        self.emit("printer:statusUpdate", self._printerStatus, "OFFLINE");
+        self._printerStatus = "OFFLINE";
+        if (self.currentJob) self.emit("job:pause", self.currentJob, true);
+      });
+      client.on("offline", () => {
+        self.emit("client:disconnect", true);
+        self.emit("printer:statusUpdate", self._printerStatus, "OFFLINE");
+        self._printerStatus = "OFFLINE";
+        if (self.currentJob) self.emit("job:pause", self.currentJob, true);
+      });
+      client.on("message", (topic: string, payload: Buffer) =>
+        self.emit("rawMessage", topic, payload)
+      );
+      client.on("error", (err: Error) => {
+        self.emit("client:error", err);
+        reject(err);
+      });
+    });
+    // H2S/H2D printers don't respond to get_version with module info.
+    // Infer model from serial number prefix so downstream code works.
+    if (!this.data.model) {
+      const inferred = this.inferModelFromSerial();
+      if (inferred) {
+        (this.data as any).model = inferred;
+        this.emit("printer:dataUpdate", this.data, { model: inferred } as any);
+      }
+    }
+    return [undefined as unknown as void];
+  }
+}
+
+/** Build FTPS secureOptions that include the client cert+key when available. */
+function ftpsSecureOptions(): Record<string, unknown> {
+  const opts: Record<string, unknown> = { rejectUnauthorized: false };
+  if (CLIENT_CREDS) {
+    opts.cert = CLIENT_CREDS.cert;
+    opts.key = CLIENT_CREDS.key;
+  }
+  return opts;
+}
+
 class BambuClientStore {
   private printers: Map<string, BambuClient> = new Map();
   private initialConnectionPromises: Map<string, Promise<void>> = new Map();
+  private reportSnapshots: Map<string, Record<string, any>> = new Map();
+  private initialReportPromises: Map<string, Promise<void>> = new Map();
+  private initialReportResolvers: Map<string, () => void> = new Map();
+
+  private ensureInitialReportPromise(key: string): Promise<void> {
+    const existing = this.initialReportPromises.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = new Promise<void>((resolve) => {
+      this.initialReportResolvers.set(key, resolve);
+    });
+    this.initialReportPromises.set(key, promise);
+    return promise;
+  }
+
+  private resolveInitialReport(key: string): void {
+    const resolve = this.initialReportResolvers.get(key);
+    if (!resolve) {
+      return;
+    }
+
+    this.initialReportResolvers.delete(key);
+    resolve();
+  }
+
+  private updateReportSnapshot(key: string, update: Record<string, any>): void {
+    if (!update || Object.keys(update).length === 0) {
+      return;
+    }
+
+    const previous = this.reportSnapshots.get(key) || {};
+    this.reportSnapshots.set(key, { ...previous, ...update });
+    this.resolveInitialReport(key);
+  }
+
+  getCachedReport(host: string, serial: string, token: string): Record<string, any> | null {
+    return this.reportSnapshots.get(getPrinterKey(host, serial, token)) || null;
+  }
+
+  async waitForInitialReport(
+    host: string,
+    serial: string,
+    token: string,
+    timeoutMs = 4000
+  ): Promise<Record<string, any> | null> {
+    const key = getPrinterKey(host, serial, token);
+    const existing = this.reportSnapshots.get(key);
+    if (existing && Object.keys(existing).length > 0) {
+      return existing;
+    }
+
+    const reportPromise = this.ensureInitialReportPromise(key);
+
+    try {
+      await Promise.race([
+        reportPromise,
+        sleep(timeoutMs).then(() => {
+          throw new Error(`Timed out waiting for initial printer report after ${timeoutMs}ms.`);
+        }),
+      ]);
+    } catch (error) {
+      console.warn(`No initial printer report received for ${serial}:`, error);
+    }
+
+    return this.reportSnapshots.get(key) || null;
+  }
 
   async getPrinter(host: string, serial: string, token: string): Promise<BambuClient> {
-    const key = `${host}-${serial}`;
+    const key = getPrinterKey(host, serial, token);
 
     if (this.printers.has(key)) {
       return this.printers.get(key)!;
@@ -52,10 +295,27 @@ class BambuClientStore {
       throw new Error(`Existing Bambu client connection for ${key} failed.`);
     }
 
-    const printer = new BambuClient({
+    const printer = new TolerantBambuClient({
       host,
       serialNumber: serial,
       accessToken: token,
+    });
+    this.ensureInitialReportPromise(key);
+
+    printer.on("rawMessage", (_topic, payload) => {
+      try {
+        const parsed = JSON.parse(payload.toString());
+        const printMessage = parsed?.print;
+        if (printMessage && typeof printMessage === "object") {
+          this.updateReportSnapshot(key, printMessage);
+        }
+      } catch {
+        // Ignore unrelated payloads.
+      }
+    });
+
+    printer.on("printer:dataUpdate", (data) => {
+      this.updateReportSnapshot(key, data);
     });
 
     printer.on("client:connect", () => {
@@ -66,11 +326,15 @@ class BambuClientStore {
     printer.on("client:error", () => {
       this.printers.delete(key);
       this.initialConnectionPromises.delete(key);
+      this.initialReportPromises.delete(key);
+      this.initialReportResolvers.delete(key);
     });
 
     printer.on("client:disconnect", () => {
       this.printers.delete(key);
       this.initialConnectionPromises.delete(key);
+      this.initialReportPromises.delete(key);
+      this.initialReportResolvers.delete(key);
     });
 
     const connectPromise = printer.connect().then(() => {});
@@ -103,6 +367,8 @@ class BambuClientStore {
     await Promise.allSettled(disconnectPromises);
     this.printers.clear();
     this.initialConnectionPromises.clear();
+    this.initialReportPromises.clear();
+    this.initialReportResolvers.clear();
   }
 }
 
@@ -167,16 +433,16 @@ export class BambuImplementation {
       const printer = await this.getPrinter(host, serial, token);
 
       try {
-        await printer.executeCommand(new PushAllCommand());
+        await invokeWithoutAck(printer, new PushAllCommand());
       } catch (error) {
         console.warn("PushAllCommand failed, continuing with cached status", error);
       }
 
-      if (!printer.data || Object.keys(printer.data).length === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-
-      const data = printer.data;
+      const cachedData = await this.printerStore.waitForInitialReport(host, serial, token);
+      const data =
+        cachedData && Object.keys(cachedData).length > 0
+          ? cachedData
+          : printer.data;
 
       return {
         status: data.gcode_state || "UNKNOWN",
@@ -200,7 +466,7 @@ export class BambuImplementation {
           totalLayers: data.total_layer_num || 0,
         },
         ams: data.ams || null,
-        model: data.model || "Unknown",
+        model: resolveModelName(data),
         serial,
         raw: data,
       };
@@ -220,16 +486,29 @@ export class BambuImplementation {
       throw new Error("print3mf requires a .3mf input file.");
     }
 
-    const projectMetadata = await this.resolveProjectFileMetadata(
-      options.filePath,
-      options.plateIndex
-    );
-
     const remoteFileName = path.basename(options.filePath);
     const remoteProjectPath = `cache/${remoteFileName}`;
 
     // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
     await this.ftpUpload(host, token, options.filePath, `/cache/${remoteFileName}`);
+
+    // Pre-sliced .gcode.3mf files contain embedded gcode and must be started
+    // with gcode_file, not project_file — project_file tries to parse slicer
+    // metadata that isn't present in .gcode.3mf and returns error 405004002.
+    if (options.filePath.toLowerCase().endsWith(".gcode.3mf")) {
+      const printer = await this.getPrinter(host, serial, token);
+      await invokeWithoutAck(printer, new GCodeFileCommand({ fileName: remoteProjectPath }));
+      return {
+        status: "success",
+        message: `Uploaded and started gcode.3mf print: ${options.projectName}`,
+        remoteProjectPath,
+      };
+    }
+
+    const projectMetadata = await this.resolveProjectFileMetadata(
+      options.filePath,
+      options.plateIndex
+    );
 
     // Send project_file command via bambu-node MQTT (bypasses bambu-js
     // hardcoded use_ams=true and missing ams_mapping support)
@@ -288,7 +567,7 @@ export class BambuImplementation {
     const printer = await this.getPrinter(host, serial, token);
 
     try {
-      await printer.executeCommand(new UpdateStateCommand({ state: "stop" }));
+      await invokeWithoutAck(printer, new UpdateStateCommand({ state: "stop" }));
       return { status: "success", message: "Cancel command sent successfully." };
     } catch (error) {
       throw new Error(`Failed to cancel print: ${(error as Error).message}`);
@@ -327,7 +606,7 @@ export class BambuImplementation {
       );
     }
 
-    await printer.executeCommand(new GCodeLineCommand({ gcodes: [gcode] }));
+    await invokeWithoutAck(printer, new GCodeLineCommand({ gcodes: [gcode] }));
     return {
       status: "success",
       message: `Temperature command sent for ${normalizedComponent}.`,
@@ -422,7 +701,8 @@ export class BambuImplementation {
   }
 
   async startJob(host: string, serial: string, token: string, filename: string) {
-    if (filename.toLowerCase().endsWith(".3mf")) {
+    const lower = filename.toLowerCase();
+    if (lower.endsWith(".3mf") && !lower.endsWith(".gcode.3mf")) {
       throw new Error("Use print_3mf for .3mf project files.");
     }
 
@@ -433,7 +713,7 @@ export class BambuImplementation {
       ? normalizedFileName
       : `cache/${normalizedFileName}`;
 
-    await printer.executeCommand(new GCodeFileCommand({ fileName: remoteFile }));
+    await invokeWithoutAck(printer, new GCodeFileCommand({ fileName: remoteFile }));
 
     return {
       status: "success",
@@ -462,7 +742,7 @@ export class BambuImplementation {
         user: "bblp",
         password: token,
         secure: "implicit",
-        secureOptions: { rejectUnauthorized: false },
+        secureOptions: ftpsSecureOptions(),
       });
       // Use absolute path to avoid CWD side-effects
       const absoluteRemote = remotePath.startsWith("/") ? remotePath : `/${remotePath}`;

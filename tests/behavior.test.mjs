@@ -161,7 +161,7 @@ test("printer model safety: schema requires bambu_model, rejects missing/invalid
   );
   assert.deepEqual(
     print3mfTool.inputSchema.properties.bambu_model.enum,
-    ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d"],
+    ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
     "print_3mf bambu_model must enumerate all valid models"
   );
 

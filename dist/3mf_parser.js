@@ -77,7 +77,12 @@ function parseBambuJSONConfig(jsonData) {
 }
 async function parseBambuConfig(zip) {
     // Look for common Bambu config file names
-    const potentialFiles = ['Metadata/project_settings.config', 'Metadata/model_settings.config', 'Metadata/slice_info.config'];
+    const potentialFiles = [
+        'Metadata/project_settings.config',
+        'Metadata/Slic3r_PE.config',
+        'Metadata/model_settings.config',
+        'Metadata/slice_info.config'
+    ];
     let configFile = null;
     let configContent = '';
     for (const name of potentialFiles) {
@@ -213,4 +218,24 @@ export async function parse3MF(filePath) {
         console.error(`Error parsing 3MF file ${filePath}:`, error);
         throw new Error(`Failed to parse 3MF file: ${error.message}`);
     }
+}
+export async function extractBambuTemplateSettings(filePath, outputDir) {
+    const data = await fs.readFile(filePath);
+    const zip = await JSZip.loadAsync(data);
+    const potentialFiles = [
+        'Metadata/project_settings.config',
+        'Metadata/Slic3r_PE.config',
+        'Metadata/model_settings.config',
+        'Metadata/slice_info.config'
+    ];
+    for (const name of potentialFiles) {
+        const file = zip.file(name);
+        if (!file)
+            continue;
+        const content = await file.async('string');
+        const outputPath = `${outputDir}/${name.replace(/\//g, '_')}`;
+        await fs.writeFile(outputPath, content, 'utf8');
+        return outputPath;
+    }
+    throw new Error(`No slicer settings config found in template 3MF: ${filePath}`);
 }

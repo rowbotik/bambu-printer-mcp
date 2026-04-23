@@ -11,6 +11,8 @@ A Bambu Lab-focused MCP server for controlling Bambu printers, manipulating STL 
 
 This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server). All OctoPrint, Klipper, Duet, Repetier, Prusa Connect, and Creality Cloud support has been removed. What remains is a focused, lean implementation for Bambu Lab hardware.
 
+Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the custom H2D/H2S patches, per-printer MCP split, and remote deployment plan used in this clone.
+
 <details>
 <summary><strong>Click to expand Table of Contents</strong></summary>
 
@@ -64,6 +66,7 @@ This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://gith
 ## Features
 
 - Get detailed printer status: temperatures (nozzle, bed, chamber), print progress, current layer, time remaining, and live AMS slot data
+- Query live AMS inventory with resolved Bambu/Orca filament profile paths via `get_printer_filaments`
 - List, upload, and manage files on the printer's SD card via FTPS
 - Upload and print `.3mf` files with full plate selection and calibration flag control
 - Automatic slicing: pass an unsliced 3MF to `print_3mf` and the server will slice it with BambuStudio CLI (or another configured slicer) before uploading
@@ -73,6 +76,12 @@ This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://gith
 - Start G-code files already stored on the printer
 - STL manipulation: scale, rotate, extend base, merge vertices, center at origin, lay flat, and inspect model info
 - Slice STL or 3MF files using BambuStudio, OrcaSlicer, PrusaSlicer, Cura, or Slic3r
+- Inspect slicer settings from a saved 3MF template or extracted profile via `get_slice_settings`
+- Enumerate saved slicing templates from the local registry via `list_templates`
+- Save templates into the local registry via `save_template`
+- Slice directly from a named template via `slice_with_template`
+- For simple single-material slices, auto-select the printer's current or first loaded AMS filament when no explicit slicer profile or `load_filaments` override is provided
+- Template-driven slicing can reuse a saved 3MF's process settings while still pulling the live printer filament choice over MQTT
 - Optional Blender MCP bridge for advanced mesh operations
 - Dual transport: stdio (default, for Claude Desktop / Claude Code) and Streamable HTTP
 
@@ -127,9 +136,12 @@ Create a `.env` file in the directory where you run the server, or pass environm
 PRINTER_HOST=192.168.1.100        # IP address of your Bambu printer on the local network
 BAMBU_SERIAL=01P00A123456789      # Printer serial number (see Finding Your Serial Number below)
 BAMBU_TOKEN=your_access_token     # LAN access token from printer touchscreen
+# Compatible aliases also accepted:
+# BAMBU_PRINTER_HOST / BAMBU_PRINTER_SERIAL / BAMBU_PRINTER_ACCESS_TOKEN
 
 # --- Printer model (CRITICAL for safe operation) ---
-BAMBU_MODEL=p1s                   # Your printer model: p1s, p1p, x1c, x1e, a1, a1mini, h2d
+BAMBU_MODEL=p1s                   # Your printer model: p1s, p1p, x1c, x1e, a1, a1mini, h2d, h2s
+# Alias also accepted: BAMBU_PRINTER_MODEL
 BED_TYPE=textured_plate           # Bed plate type: textured_plate, cool_plate, engineering_plate, hot_plate
 NOZZLE_DIAMETER=0.4               # Nozzle diameter in mm (default: 0.4)
 
@@ -137,6 +149,7 @@ NOZZLE_DIAMETER=0.4               # Nozzle diameter in mm (default: 0.4)
 SLICER_TYPE=bambustudio           # Options: bambustudio, prusaslicer, orcaslicer, cura, slic3r
 SLICER_PATH=/Applications/BambuStudio.app/Contents/MacOS/BambuStudio
                                   # Default on macOS. Adjust for your OS and install path.
+# Alias also accepted: BAMBU_STUDIO_PATH
 SLICER_PROFILE=                   # Optional: path to a slicer profile/config file
 
 # --- Temporary file directory ---
@@ -161,14 +174,14 @@ BLENDER_MCP_BRIDGE_COMMAND=       # Shell command to invoke your Blender MCP bri
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
-| `PRINTER_HOST` | `localhost` | Yes | IP address of the Bambu printer |
-| `BAMBU_SERIAL` | | Yes | Printer serial number |
-| `BAMBU_TOKEN` | | Yes | LAN access token |
-| `BAMBU_MODEL` | | **Yes** | Printer model: `p1s`, `p1p`, `x1c`, `x1e`, `a1`, `a1mini`, `h2d`. **Required for safe operation** -- determines the correct G-code generation. If omitted and the MCP client supports elicitation, the server will ask you interactively. |
+| `PRINTER_HOST` | `localhost` | Yes | IP address of the Bambu printer. Alias: `BAMBU_PRINTER_HOST` |
+| `BAMBU_SERIAL` | | Yes | Printer serial number. Alias: `BAMBU_PRINTER_SERIAL` |
+| `BAMBU_TOKEN` | | Yes | LAN access token. Alias: `BAMBU_PRINTER_ACCESS_TOKEN` |
+| `BAMBU_MODEL` | | **Yes** | Printer model: `p1s`, `p1p`, `x1c`, `x1e`, `a1`, `a1mini`, `h2d`, `h2s`. **Required for safe operation** -- determines the correct G-code generation. Alias: `BAMBU_PRINTER_MODEL`. If omitted and the MCP client supports elicitation, the server will ask you interactively. |
 | `BED_TYPE` | `textured_plate` | No | Bed plate type: `textured_plate`, `cool_plate`, `engineering_plate`, `hot_plate` |
 | `NOZZLE_DIAMETER` | `0.4` | No | Nozzle diameter in mm. Used to select the correct BambuStudio machine preset. |
 | `SLICER_TYPE` | `bambustudio` | No | Slicer to use for slicing operations |
-| `SLICER_PATH` | BambuStudio macOS path | No | Full path to the slicer executable |
+| `SLICER_PATH` | BambuStudio macOS path | No | Full path to the slicer executable. Alias: `BAMBU_STUDIO_PATH` |
 | `SLICER_PROFILE` | | No | Path to a slicer profile or config file |
 | `TEMP_DIR` | `./temp` | No | Directory for intermediate files |
 | `MCP_TRANSPORT` | `stdio` | No | Transport mode: `stdio` or `streamable-http` |
@@ -234,6 +247,8 @@ This applies to all MCP servers, not just this one.
 ## Enabling Developer Mode (Required)
 
 This MCP server communicates directly with your printer over your local network using MQTT and FTPS. For this to work, **Developer Mode** must be enabled on the printer. Without it, the printer will reject third-party LAN connections even if you have the correct access code.
+
+On H2D/H2-series firmware, the printer may stream `push_status` data without ever answering the legacy `get_version` handshake used by older libraries. This fork treats the live status stream as authoritative and does not require that extra ACK before considering the connection usable.
 
 Developer Mode is available on the following firmware versions and later:
 
@@ -561,6 +576,8 @@ Note: this works best on models with a clearly dominant flat face. Results on or
 
 All printer tools accept optional `host`, `bambu_serial`, and `bambu_token` arguments. If omitted, values fall back to the environment variables `PRINTER_HOST`, `BAMBU_SERIAL`, and `BAMBU_TOKEN`. Passing them explicitly is useful when working with more than one printer.
 
+The server also accepts the alias variables `BAMBU_PRINTER_HOST`, `BAMBU_PRINTER_SERIAL`, and `BAMBU_PRINTER_ACCESS_TOKEN`, plus `BAMBU_PRINTER_MODEL` and `BAMBU_STUDIO_PATH`.
+
 #### get_printer_status
 
 Retrieve current printer state including temperatures, print progress, layer count, time remaining, and AMS slot data. Internally sends a `push_all` MQTT command to force a fresh status report before reading cached state.
@@ -698,6 +715,55 @@ Layer height, nozzle temperature, and other slicer parameters cannot be overridd
 
 ### Slicing Tools
 
+#### list_templates
+
+List saved templates from the local registry directory. By default this is `~/Sync/bambu/templates`, or you can override it with `BAMBU_TEMPLATE_DIR`.
+
+```json
+{}
+```
+
+Each result includes the template `name`, absolute `path`, source type, and relative path inside the registry. You can then pass `template_name` to `get_slice_settings`, `slice_stl`, or `print_3mf` instead of a raw path.
+
+#### save_template
+
+Copy a local `3mf`, `json`, or `.config` file into the template registry and register it under a reusable template name.
+
+```json
+{
+  "source_path": "/path/to/sliced_project.3mf",
+  "template_name": "collars/p1p_petg_default"
+}
+```
+
+This creates the destination under the template registry directory and makes it available immediately to `list_templates`, `get_slice_settings`, `slice_with_template`, `slice_stl`, and `print_3mf`.
+
+#### get_slice_settings
+
+Inspect the slicer settings embedded in a saved 3MF template or in an extracted JSON/config profile without slicing anything.
+
+```json
+{
+  "template_name": "h2s_template"
+}
+```
+
+This returns a compact summary of the high-signal settings such as printer preset, default print profile, filament profiles, layer height, infill density, shell counts, support mode, and bed type. It accepts either `source_path` or `template_name`. For 3MF inputs it also writes the extracted settings blob to a temp path so the result can be reused directly.
+
+#### slice_with_template
+
+Slice an STL or 3MF using a named template from the local registry. This is a higher-level wrapper over `slice_stl` for template-based workflows.
+
+```json
+{
+  "stl_path": "/path/to/model.stl",
+  "template_name": "collars/p1p_petg_default",
+  "bambu_model": "p1p"
+}
+```
+
+This uses the named template as the slicing profile source and still supports live printer filament selection unless you explicitly override `load_filaments`.
+
 #### slice_stl
 
 Slice an STL or 3MF file using an external slicer and return the path to the output file. The output is a sliced 3MF (for BambuStudio and OrcaSlicer) or a G-code file (for PrusaSlicer, Cura, Slic3r).
@@ -714,6 +780,8 @@ Slice an STL or 3MF file using an external slicer and return the path to the out
 `slicer_type` options: `bambustudio`, `orcaslicer`, `prusaslicer`, `cura`, `slic3r`. When omitted, the value from the `SLICER_TYPE` environment variable is used (default: `bambustudio`).
 
 `slicer_path` and `slicer_profile` fall back to the `SLICER_PATH` and `SLICER_PROFILE` environment variables when omitted.
+
+You can provide either `template_3mf_path` or `template_name` when you want to slice from a saved template. `template_name` resolves through the local template registry directory, which defaults to `~/Sync/bambu/templates`.
 
 For printing on a Bambu printer, the recommended workflow is: slice with `bambustudio` to get a sliced 3MF, then pass that output path to `print_3mf`.
 
