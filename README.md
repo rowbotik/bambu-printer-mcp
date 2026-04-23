@@ -1,17 +1,21 @@
-# bambu-printer-mcp
+# @rowbotik/bambu-printer-mcp
 
-[![npm version](https://img.shields.io/npm/v/bambu-printer-mcp.svg)](https://www.npmjs.com/package/bambu-printer-mcp)
+[![npm version](https://img.shields.io/npm/v/@rowbotik/bambu-printer-mcp.svg)](https://www.npmjs.com/package/@rowbotik/bambu-printer-mcp)
 [![License: GPL-2.0](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0%2B-blue)](https://www.typescriptlang.org/)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D%2018.0.0-green.svg)](https://nodejs.org/en/download/)
-[![GitHub stars](https://img.shields.io/github/stars/DMontgomery40/bambu-printer-mcp.svg?style=social&label=Star)](https://github.com/DMontgomery40/bambu-printer-mcp)
-[![Downloads](https://img.shields.io/npm/dm/bambu-printer-mcp.svg)](https://www.npmjs.com/package/bambu-printer-mcp)
+[![GitHub stars](https://img.shields.io/github/stars/rowbotik/bambu-printer-mcp.svg?style=social&label=Star)](https://github.com/rowbotik/bambu-printer-mcp)
+[![Downloads](https://img.shields.io/npm/dm/@rowbotik/bambu-printer-mcp.svg)](https://www.npmjs.com/package/@rowbotik/bambu-printer-mcp)
 
 A Bambu Lab-focused MCP server for controlling Bambu printers, manipulating STL files, and managing end-to-end 3MF print workflows from Claude Desktop, Claude Code, or any MCP-compatible client.
 
-This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server). All OctoPrint, Klipper, Duet, Repetier, Prusa Connect, and Creality Cloud support has been removed. What remains is a focused, lean implementation for Bambu Lab hardware.
+This is a fork of [DMontgomery40/bambu-printer-mcp](https://github.com/DMontgomery40/bambu-printer-mcp) (itself a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server)) with added support for **H2S and H2D** printers.
 
-Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the custom H2D/H2S patches, per-printer MCP split, and remote deployment plan used in this clone.
+### What this fork adds
+
+- **H2S and H2D support.** These printers never respond to the `get_version` MQTT handshake that the underlying `bambu-node` library uses for model detection. This fork detects the model from the serial number prefix instead (`093` → H2S, `094` → H2D) and skips the handshake entirely, so the connection succeeds and status polling works correctly.
+- **mTLS for post-Jan-2025 H2D firmware.** Newer H2D firmware requires a Bambu-issued client certificate for MQTT and FTPS. Place `embedded-cert.pem` and `embedded-key.pem` in `~/Desktop/bambu certs/` (or point `BAMBU_CLIENT_CERT` / `BAMBU_CLIENT_KEY` at them) and the server will use them automatically.
+- **Pre-sliced `.gcode.3mf` support.** Files exported from BambuStudio as "Plate Sliced File" (`.gcode.3mf`) are now detected and started with `gcode_file` instead of `project_file`, avoiding the 405004002 parse error that occurred when the printer tried to read them as full project files.
 
 <details>
 <summary><strong>Click to expand Table of Contents</strong></summary>
@@ -100,7 +104,7 @@ Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the c
 The fastest way to get started. No global install required:
 
 ```bash
-npx bambu-printer-mcp
+npx @rowbotik/bambu-printer-mcp
 ```
 
 Set environment variables inline or via a `.env` file in your working directory (see [Configuration](#configuration)).
@@ -108,7 +112,7 @@ Set environment variables inline or via a `.env` file in your working directory 
 ### Install globally from npm
 
 ```bash
-npm install -g bambu-printer-mcp
+npm install -g @rowbotik/bambu-printer-mcp
 ```
 
 After installation, the `bambu-printer-mcp` command is available in your PATH.
@@ -116,7 +120,7 @@ After installation, the `bambu-printer-mcp` command is available in your PATH.
 ### Install from source
 
 ```bash
-git clone https://github.com/DMontgomery40/bambu-printer-mcp.git
+git clone https://github.com/rowbotik/bambu-printer-mcp.git
 cd bambu-printer-mcp
 npm install
 npm run build
@@ -204,7 +208,7 @@ Add this server to your MCP client's config (Claude Desktop, Claude Code, Cursor
   "mcpServers": {
     "bambu-printer": {
       "command": "npx",
-      "args": ["-y", "bambu-printer-mcp"],
+      "args": ["-y", "@rowbotik/bambu-printer-mcp"],
       "env": {
         "PRINTER_HOST": "192.168.1.100",
         "BAMBU_SERIAL": "01P00A123456789",
@@ -302,6 +306,8 @@ The serial number is printed on a sticker on the back or underside of the printe
 - P1 Series: begins with `01P`
 - X1 Series: begins with `01X`
 - A1 Series: begins with `01A`
+- H2S: begins with `093`
+- H2D: begins with `094`
 
 You can also find it on the printer's touchscreen. Navigate to **Settings** and select the **Device Info** page:
 
@@ -416,7 +422,7 @@ Bambu Lab printers do not use a conventional REST API. Instead, they expose two 
 
 ### What this fork fixes
 
-Both this package and the parent project (`mcp-3D-printer-server`) include fixes for two protocol-level issues in the underlying `bambu-js` library.
+This package includes fixes for protocol-level issues in the underlying `bambu-js` library, plus the H2S/H2D-specific additions described at the top of this README.
 
 **Bug 1: FTP double-path error in bambu-js.**
 
@@ -926,7 +932,7 @@ After connecting the MCP server in Claude Desktop or Claude Code, you can ask Cl
 
 Understanding these constraints will help you avoid frustrating errors and set appropriate expectations.
 
-1. **Printable 3MF required for print_3mf.** The `print_3mf` tool expects a sliced 3MF containing at least one `Metadata/plate_<n>.gcode` entry. If you pass an unsliced 3MF (one exported from a CAD tool without slicing), the server will attempt to auto-slice it using the configured slicer. If auto-slicing fails, the tool errors out rather than sending an incomplete command to the printer.
+1. **Printable 3MF required for print_3mf.** The `print_3mf` tool expects a sliced 3MF containing at least one `Metadata/plate_<n>.gcode` entry. If you pass an unsliced 3MF (one exported from a CAD tool without slicing), the server will attempt to auto-slice it using the configured slicer. If auto-slicing fails, the tool errors out rather than sending an incomplete command to the printer. Pre-sliced `.gcode.3mf` files (exported from BambuStudio as "Plate Sliced File") are supported directly and bypass the project file path entirely.
 
 2. **Layer height, temperature, and slicer settings are baked in.** The `project_file` MQTT command tells the printer which plate to run. It does not support overriding layer height, temperature targets, infill percentage, or other slicing parameters at print time. These must be set in your slicer before generating the 3MF.
 
@@ -972,4 +978,4 @@ STL manipulation tools load the entire mesh into memory as Three.js geometry. Fo
 
 GPL-2.0. See [LICENSE](./LICENSE) for the full text.
 
-This project is a fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server) by David Montgomery, also GPL-2.0.
+This project is a fork of [bambu-printer-mcp](https://github.com/DMontgomery40/bambu-printer-mcp) by David Montgomery, which is itself a fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server), both GPL-2.0.
