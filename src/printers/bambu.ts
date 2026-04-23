@@ -492,17 +492,23 @@ export class BambuImplementation {
     // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
     await this.ftpUpload(host, token, options.filePath, `/cache/${remoteFileName}`);
 
-    // Pre-sliced .gcode.3mf files contain embedded gcode and must be started
-    // with gcode_file, not project_file — project_file tries to parse slicer
-    // metadata that isn't present in .gcode.3mf and returns error 405004002.
+    // Pre-sliced .gcode.3mf files: routing depends on firmware generation.
+    // P1/A1/X1 series: project_file returns 405004002 for .gcode.3mf (firmware
+    //   doesn't recognise the container), so use gcode_file instead.
+    // H2S/H2D: gcode_file is not supported; project_file works because the
+    //   firmware can open the zip and find Metadata/plate_<n>.gcode directly.
     if (options.filePath.toLowerCase().endsWith(".gcode.3mf")) {
-      const printer = await this.getPrinter(host, serial, token);
-      await invokeWithoutAck(printer, new GCodeFileCommand({ fileName: remoteProjectPath }));
-      return {
-        status: "success",
-        message: `Uploaded and started gcode.3mf print: ${options.projectName}`,
-        remoteProjectPath,
-      };
+      const isH2 = serial.startsWith("093") || serial.startsWith("094");
+      if (!isH2) {
+        const printer = await this.getPrinter(host, serial, token);
+        await invokeWithoutAck(printer, new GCodeFileCommand({ fileName: remoteProjectPath }));
+        return {
+          status: "success",
+          message: `Uploaded and started gcode.3mf print: ${options.projectName}`,
+          remoteProjectPath,
+        };
+      }
+      // H2S/H2D: fall through to project_file path below
     }
 
     const projectMetadata = await this.resolveProjectFileMetadata(
