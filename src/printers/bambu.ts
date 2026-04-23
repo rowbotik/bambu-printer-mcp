@@ -744,6 +744,11 @@ export class BambuImplementation {
         secure: "implicit",
         secureOptions: ftpsSecureOptions(),
       });
+      // With TLS 1.3 the session ticket arrives asynchronously; basic-ftp calls
+      // getSession() when opening the data channel and gets undefined if the
+      // ticket hasn't arrived yet, causing a fresh TLS negotiation that Bambu
+      // printers reject. Wait for the session ticket before proceeding.
+      await this.waitForTlsSession(client);
       // Use absolute path to avoid CWD side-effects
       const absoluteRemote = remotePath.startsWith("/") ? remotePath : `/${remotePath}`;
       const remoteDir = path.posix.dirname(absoluteRemote);
@@ -753,6 +758,19 @@ export class BambuImplementation {
     } finally {
       client.close();
     }
+  }
+
+  private async waitForTlsSession(ftpClient: FTPClient): Promise<void> {
+    const socket = (ftpClient as any).ftp?.socket;
+    if (!socket || typeof socket.getSession !== "function") return;
+    if (socket.getSession()) return;
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(resolve, 1000);
+      socket.once("session", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
   }
 
   async disconnectAll(): Promise<void> {

@@ -46,6 +46,7 @@ export declare class BambuImplementation {
      * again, resulting in e.g. /cache/cache/file.3mf).
      */
     private ftpUpload;
+    private waitForTlsSession;
     disconnectAll(): Promise<void>;
 }
 export {};
