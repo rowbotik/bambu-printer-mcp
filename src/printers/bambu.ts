@@ -491,10 +491,18 @@ export class BambuImplementation {
     // the container format from the extension.
     let remoteFileName = path.basename(options.filePath);
     remoteFileName = remoteFileName.replace(/\.gcode\.3mf\.gcode\.3mf$/i, ".gcode.3mf");
-    const remoteProjectPath = `cache/${remoteFileName}`;
+
+    // H2S/H2D land files at the FTP root and reference them via ftp:///<name>.
+    // P1/A1/X1 use /cache/<name> and file:///sdcard/cache/<name>.
+    const isH2 = serial.startsWith("093") || serial.startsWith("094");
+    const remoteProjectPath = isH2 ? remoteFileName : `cache/${remoteFileName}`;
+    const remoteUploadPath = isH2 ? `/${remoteFileName}` : `/cache/${remoteFileName}`;
+    const projectUrl = isH2
+      ? `ftp:///${remoteFileName}`
+      : `file:///sdcard/${remoteProjectPath}`;
 
     // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
-    await this.ftpUpload(host, token, options.filePath, `/cache/${remoteFileName}`);
+    await this.ftpUpload(host, token, options.filePath, remoteUploadPath);
 
     // Pre-sliced .gcode.3mf files: routing depends on firmware generation.
     // P1/A1/X1 series: project_file returns 405004002 for .gcode.3mf (firmware
@@ -502,7 +510,6 @@ export class BambuImplementation {
     // H2S/H2D: gcode_file is not supported; project_file works because the
     //   firmware can open the zip and find Metadata/plate_<n>.gcode directly.
     if (options.filePath.toLowerCase().endsWith(".gcode.3mf")) {
-      const isH2 = serial.startsWith("093") || serial.startsWith("094");
       if (!isH2) {
         const printer = await this.getPrinter(host, serial, token);
         await invokeWithoutAck(printer, new GCodeFileCommand({ fileName: remoteProjectPath }));
@@ -525,23 +532,42 @@ export class BambuImplementation {
     const printer = await this.getPrinter(host, serial, token);
     const md5 = options.md5 ?? projectMetadata.md5;
 
-    // Build AMS mapping per OpenBambuAPI spec: 5-element array
-    // [-1,-1,-1,-1,0] means slot 0 only; pad unused slots with -1
+    // Build AMS mapping per OpenBambuAPI spec: 5-element array where
+    // position i = filament index in the print, value = AMS slot (0-3)
+    // or -1 for unused. A single-filament print from AMS slot 0 is
+    // [0, -1, -1, -1, -1]. Required on AMS-equipped printers (H2S, X1C
+    // with AMS, etc.) even when the user thinks "no AMS" -- firmware
+    // looks up the mapping table whenever the 3MF declares filaments,
+    // and a missing/invalid mapping fails with 0700-8012-032015
+    // "Failed to get AMS mapping table".
     let amsMapping: number[];
     if (options.amsMapping && options.amsMapping.length > 0) {
+      if (options.amsMapping.length > 5) {
+        throw new Error(
+          `ams_mapping has ${options.amsMapping.length} entries; max 5 (one per filament slot)`
+        );
+      }
+      for (const v of options.amsMapping) {
+        if (!Number.isInteger(v) || v < -1 || v > 3) {
+          throw new Error(
+            `ams_mapping values must be integers in [-1, 3] (AMS slot index or -1 for unused); got ${v}`
+          );
+        }
+      }
       amsMapping = Array.from({ length: 5 }, (_, i) =>
         i < options.amsMapping!.length ? options.amsMapping![i] : -1
       );
     } else {
-      amsMapping = [-1, -1, -1, -1, 0];
+      amsMapping = [0, -1, -1, -1, -1];
     }
 
     const projectFileCmd = {
       print: {
         command: "project_file",
         param: `Metadata/${projectMetadata.plateFileName}`,
-        url: `file:///sdcard/${remoteProjectPath}`,
-        subtask_name: options.projectName,
+        url: projectUrl,
+        file: isH2 ? remoteFileName : undefined,
+        subtask_name: isH2 ? remoteFileName : options.projectName,
         md5,
         flow_cali: options.flowCalibration ?? true,
         layer_inspect: options.layerInspect ?? true,

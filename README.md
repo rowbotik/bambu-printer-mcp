@@ -37,6 +37,7 @@ This is a fork of [DMontgomery40/bambu-printer-mcp](https://github.com/DMontgome
 - [AMS (Automatic Material System) Setup](#ams-automatic-material-system-setup)
 - [Bambu Communication Notes (MQTT and FTP)](#bambu-communication-notes-mqtt-and-ftp)
   - [What this fork fixes](#what-this-fork-fixes)
+  - [Verified print procedure (H2S, LAN-only, no client cert)](#verified-print-procedure-h2s-lan-only-no-client-cert)
 - [Available Tools](#available-tools)
   - [STL Manipulation Tools](#stl-manipulation-tools)
   - [Printer Control Tools](#printer-control-tools)
@@ -449,23 +450,91 @@ private async ftpUpload(host, token, localPath, remotePath): Promise<void> {
 
 The `bambu-js` library's project file command hardcodes `use_ams: true` and does not support the `ams_mapping` field at all. Without the fix, the mapping is a simple array of slot indices (e.g., `[0, 2]`), which does not match the OpenBambuAPI specification.
 
-According to the OpenBambuAPI spec, `ams_mapping` must be a 5-element array where each position corresponds to a filament color slot in the print file. Unused positions must be padded with `-1`. For example, a print using only AMS slot 0 sends `[-1, -1, -1, -1, 0]`.
+According to the OpenBambuAPI spec, `ams_mapping` is a 5-element array where **position `i` is the filament index in the print file** and **the value is the AMS slot (0-3)** that feeds that filament, or `-1` if the filament is not sourced from the AMS. A single-filament print that pulls from AMS slot 0 sends `[0, -1, -1, -1, -1]` -- **not** `[-1, -1, -1, -1, 0]` (that would route filament index 4 to slot 0 and leave filament 0 unmapped).
 
-This fork sends the `project_file` command directly via `bambu-node` (bypassing `bambu-js` entirely for print initiation) and constructs the `ams_mapping` array correctly:
+This fork sends the `project_file` command directly via `bambu-node` (bypassing `bambu-js` entirely for print initiation), validates each mapping value is in `[-1, 3]`, and constructs the array correctly:
 
 ```typescript
 // From src/printers/bambu.ts
 let amsMapping: number[];
 if (options.amsMapping && options.amsMapping.length > 0) {
+  // validates length <= 5 and values in [-1, 3]
   amsMapping = Array.from({ length: 5 }, (_, i) =>
     i < options.amsMapping!.length ? options.amsMapping![i] : -1
   );
 } else {
-  amsMapping = [-1, -1, -1, -1, 0];  // default: slot 0 only
+  amsMapping = [0, -1, -1, -1, -1];  // default: filament 0 <- AMS slot 0
 }
 ```
 
+**AMS-equipped printers (H2S, X1C with AMS, etc.):** you must send `use_ams: true` with a valid `ams_mapping` whenever the 3MF declares filaments, even if you conceptually think of the print as "no AMS." The firmware looks up the mapping table unconditionally; if the lookup fails you get **`Print Stopped -- Failed to get AMS mapping table [0700-8012-032015]`** on the touchscreen. Setting `use_ams: false` does **not** skip the lookup on these models.
+
 The command payload also includes all required fields per the OpenBambuAPI spec: `param` (the internal gcode path within the 3MF), `url` (the sdcard path), `md5` (computed from the plate's embedded gcode), and all calibration flags.
+
+### Verified print procedure (H2S, LAN-only, no client cert)
+
+This is the sequence that successfully started a print on an H2S running current (post-Jan 2025) firmware in LAN-only mode. It's documented here because several common approaches fail on this firmware, and this fork's transport is what makes it reliable.
+
+**Result:** print started in `RUNNING` state, printer accepted the MQTT `project_file` command, no client certificate was required. Authentication was plain `bblp` + LAN access code over TLS with `rejectUnauthorized: false`.
+
+**What doesn't work on stock bambu-cli:**
+
+- `bambu-cli print start <file>` and `bambu-cli files upload` both fail with `522 SSL connection failed: session reuse required`. Bambu's FTPS server requires TLS session reuse between the control and data channels, which the Go FTPS client in bambu-cli does not negotiate correctly.
+- `bambu-cli print start --no-upload` still opens an FTPS session (to stat the remote file) and hits the same 522.
+
+**What works — two-step upload + MQTT dispatch:**
+
+1. **Upload the `.gcode.3mf` via curl** (curl's OpenSSL backend negotiates FTPS session reuse correctly):
+
+   ```bash
+   curl -k --ftp-pasv --ssl-reqd \
+     -u "bblp:<ACCESS_CODE>" \
+     -T /path/to/file.gcode.3mf \
+     "ftps://<PRINTER_IP>:990/<remote-name>.gcode.3mf"
+   ```
+
+   Keep `<remote-name>` simple ASCII, ending in `.gcode.3mf`. The file lands at the FTP root, which corresponds to `/data/` on the printer's SD card.
+
+2. **Send the `project_file` command over MQTT** to `device/<SERIAL>/request`:
+
+   ```js
+   import mqtt from "mqtt";
+   const payload = {
+     print: {
+       sequence_id: "0",
+       command: "project_file",
+       param: "Metadata/plate_1.gcode",          // path inside the 3MF
+       subtask_name: "<remote-name>.gcode.3mf",
+       file: "<remote-name>.gcode.3mf",
+       url: "ftp:///<remote-name>.gcode.3mf",    // three slashes, FTP root
+       md5: "",
+       project_id: "0", profile_id: "0", task_id: "0", subtask_id: "0",
+       timelapse: false,
+       bed_type: "auto",
+       bed_leveling: true, bed_levelling: true,
+       flow_cali: true, vibration_cali: true, layer_inspect: true,
+       use_ams: true,
+       ams_mapping: [0, -1, -1, -1, -1]   // filament 0 <- AMS slot 0
+     }
+   };
+   const client = mqtt.connect(`mqtts://<PRINTER_IP>:8883`, {
+     username: "bblp",
+     password: "<ACCESS_CODE>",
+     rejectUnauthorized: false,
+   });
+   client.on("connect", () => {
+     client.publish(`device/<SERIAL>/request`, JSON.stringify(payload));
+   });
+   ```
+
+**Notes:**
+
+- `url` must be `ftp:///<filename>` (three slashes) — the empty host component is required; the printer rejects `ftp://<filename>` as "unsupported print file path or name".
+- `param` uses the internal plate path inside the 3MF (`Metadata/plate_1.gcode` for plate 1), not a filesystem path.
+- `md5: ""` is accepted; populating it is optional.
+- **H2S and other AMS-equipped printers require `use_ams: true` plus a valid `ams_mapping` whenever the 3MF declares filaments.** Sending `use_ams: false` on an H2S stops the print with `Failed to get AMS mapping table [0700-8012-032015]` because the firmware still looks up the mapping. For a single-filament print from AMS slot 0, send `use_ams: true` and `ams_mapping: [0, -1, -1, -1, -1]`. Only set `use_ams: false` on printers that have no AMS at all (e.g. base A1 mini without AMS lite).
+- No client X.509 certificate was needed. The earlier assumption that post-Jan 2025 firmware mandates mTLS on all models does not hold for the H2S in LAN mode — user/password over TLS is sufficient.
+- The MCP server's `ftpUpload` helper (basic-ftp with `secure: "implicit"` and a short idle timeout) performs the equivalent upload natively and is the preferred path when using the server itself; the curl form is the manual-debug equivalent.
 
 ---
 
