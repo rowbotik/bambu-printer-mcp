@@ -1176,7 +1176,12 @@ class BambuPrinterMCPServer {
                 use_ams: { type: "boolean", description: "Whether to use the AMS (default: auto-detect from 3MF)" },
                 ams_mapping: {
                   type: "array",
-                  description: "AMS slot mapping array, e.g. [0, 2] maps filaments to AMS slots 0 and 2",
+                  description: "Project-level AMS mapping array. Position = project filament index, value = absolute AMS tray (0-3=AMS 0, 4-7=AMS 1, 8-11=AMS 2, 128+=AMS-HT, 254=external, -1=unused). Prefer ams_slots unless you know the project-level layout.",
+                  items: { type: "number" }
+                },
+                ams_slots: {
+                  type: "array",
+                  description: "Preferred AMS input: one absolute tray index per USED filament in plate order, e.g. [1] for a single-filament print pulling from AMS 0 slot 1. Expanded to project-level ams_mapping automatically from the 3MF's plate_N.json and gcode header.",
                   items: { type: "number" }
                 },
                 bed_leveling: { type: "boolean", description: "Enable auto bed leveling (default: true)" },

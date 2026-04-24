@@ -2,21 +2,22 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
-import os from "node:os";
+import { fileURLToPath } from "node:url";
 import JSZip from "jszip";
 import { Client as FTPClient } from "basic-ftp";
 import { BambuPrinter } from "bambu-js";
 import * as mqtt from "mqtt";
 import { BambuClient, GCodeFileCommand, GCodeLineCommand, PushAllCommand, UpdateStateCommand, } from "bambu-node";
 /**
- * Post-Jan-2025 H2D firmware requires mTLS with a Bambu-issued client cert.
+ * Optional Bambu-issued client cert support for firmware that requires mTLS.
  * Loads cert+key once from:
  *   - BAMBU_CLIENT_CERT / BAMBU_CLIENT_KEY env vars (paths), or
- *   - ~/Desktop/bambu certs/embedded-cert.pem + embedded-key.pem (default)
+ *   - <project-root>/certs/bambu/embedded-cert.pem + embedded-key.pem (default)
  * Returns null if files missing — caller falls back to no-cert TLS.
  */
 function loadClientCreds() {
-    const defaultDir = path.join(os.homedir(), "Desktop", "bambu certs");
+    const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const defaultDir = path.join(projectRoot, "certs", "bambu");
     const certPath = process.env.BAMBU_CLIENT_CERT || path.join(defaultDir, "embedded-cert.pem");
     const keyPath = process.env.BAMBU_CLIENT_KEY || path.join(defaultDir, "embedded-key.pem");
     try {
@@ -98,9 +99,9 @@ class TolerantBambuClient extends BambuClient {
         return undefined;
     }
     /**
-     * Override bambu-node's MQTT connect to pass a client cert+key for mTLS.
+     * Override bambu-node's MQTT connect to pass a client cert+key when present.
      * Post-Jan-2025 H2D firmware rejects TLS handshakes without a valid Bambu-
-     * issued client certificate. Options mirror the upstream implementation
+     * client certificate. Options mirror the upstream implementation
      * plus `cert`/`key` when creds are available.
      */
     async connect() {
@@ -338,10 +339,52 @@ export class BambuImplementation {
         }
         const gcodeBuffer = await selectedEntry.async("nodebuffer");
         const md5 = createHash("md5").update(gcodeBuffer).digest("hex");
+        // Project filament count: parse the gcode header line
+        // `; filament_colour = #FFFFFF;#FF911A80;#DCF478;#DCF478`
+        // This is the authoritative source -- it always reflects the slicer's
+        // project filament list length. We only scan the first ~32KB of the
+        // gcode to keep this cheap even on large plates.
+        let projectFilamentCount = 1;
+        const head = gcodeBuffer.slice(0, 32 * 1024).toString("utf8");
+        const colourLine = head.match(/;\s*filament_colour\s*=\s*([^\n\r]+)/i);
+        if (colourLine) {
+            projectFilamentCount = colourLine[1].split(";").filter((s) => s.trim()).length;
+        }
+        else {
+            // Fallback: count filament_ids header entries.
+            const idsLine = head.match(/;\s*filament_ids\s*=\s*([^\n\r]+)/i);
+            if (idsLine) {
+                projectFilamentCount = idsLine[1].split(";").filter((s) => s.trim()).length;
+            }
+        }
+        // Used filament positions: from Metadata/plate_<n>.json.filament_ids.
+        // These are 0-based positions into the project filament list that the
+        // selected plate actually consumes.
+        let usedFilamentPositions = [];
+        const plateJsonName = selectedEntry.name.replace(/\.gcode$/i, ".json");
+        const plateJsonEntry = zip.file(plateJsonName);
+        if (plateJsonEntry) {
+            try {
+                const raw = await plateJsonEntry.async("string");
+                const json = JSON.parse(raw);
+                if (Array.isArray(json.filament_ids)) {
+                    usedFilamentPositions = json.filament_ids
+                        .filter((n) => Number.isInteger(n))
+                        .map((n) => n);
+                }
+            }
+            catch {
+                // tolerate malformed plate_N.json -- caller can pass amsMapping directly
+            }
+        }
+        if (usedFilamentPositions.length === 0)
+            usedFilamentPositions = [0];
         return {
             plateFileName: path.posix.basename(selectedEntry.name),
             plateInternalPath: selectedEntry.name,
             md5,
+            projectFilamentCount,
+            usedFilamentPositions,
         };
     }
     async getStatus(host, serial, token) {
@@ -430,52 +473,155 @@ export class BambuImplementation {
         // hardcoded use_ams=true and missing ams_mapping support)
         const printer = await this.getPrinter(host, serial, token);
         const md5 = options.md5 ?? projectMetadata.md5;
-        // Build AMS mapping per OpenBambuAPI spec: 5-element array where
-        // position i = filament index in the print, value = AMS slot (0-3)
-        // or -1 for unused. A single-filament print from AMS slot 0 is
-        // [0, -1, -1, -1, -1]. Required on AMS-equipped printers (H2S, X1C
-        // with AMS, etc.) even when the user thinks "no AMS" -- firmware
-        // looks up the mapping table whenever the 3MF declares filaments,
-        // and a missing/invalid mapping fails with 0700-8012-032015
-        // "Failed to get AMS mapping table".
-        let amsMapping;
+        // Build AMS mapping.
+        //
+        // Convention: position = project-level filament index, value = absolute
+        // tray index (0-3 = AMS 0 trays, 4-7 = AMS 1, 8-11 = AMS 2, 128+ = AMS-HT,
+        // 254 = external spool, -1 = unused). Required on AMS-equipped printers
+        // even when you think "no AMS" -- firmware looks up the mapping table
+        // whenever the 3MF declares filaments, and a missing/invalid mapping
+        // fails with 0700-8012-032015 "Failed to get AMS mapping table".
+        //
+        // For H2-series the array length MUST equal the project-level filament
+        // count declared by the slicer (parsed from the gcode header's
+        // `filament_colour` list). For P1/A1/X1 we pad to length 5 per the
+        // historical bambu-js behavior.
+        //
+        // Caller ergonomics: callers typically know only "I want to pull this
+        // print's filaments from these AMS slots" in the order the plate uses
+        // them. We expose `amsSlots` for that -- one entry per position in
+        // `plate_N.json.filament_ids` -- and expand to a full project-level
+        // array here. `amsMapping` is the raw escape hatch (takes precedence
+        // when both are supplied).
+        const validateTrayValue = (v, label) => {
+            if (!Number.isInteger(v) || v < -1 || (v > 15 && v < 128) || v > 254) {
+                throw new Error(`${label} values must be integers in [-1, 15] (absolute tray) or 128-254 (HT/external); got ${v}`);
+            }
+        };
+        let baseMapping;
         if (options.amsMapping && options.amsMapping.length > 0) {
-            if (options.amsMapping.length > 5) {
-                throw new Error(`ams_mapping has ${options.amsMapping.length} entries; max 5 (one per filament slot)`);
+            for (const v of options.amsMapping)
+                validateTrayValue(v, "ams_mapping");
+            baseMapping = options.amsMapping.slice();
+        }
+        else if (options.amsSlots && options.amsSlots.length > 0) {
+            for (const v of options.amsSlots)
+                validateTrayValue(v, "amsSlots");
+            // Expand per-used-filament slots into a project-level array.
+            const positions = projectMetadata.usedFilamentPositions;
+            if (options.amsSlots.length !== positions.length) {
+                throw new Error(`amsSlots length ${options.amsSlots.length} does not match used filament count ${positions.length} (plate uses positions ${JSON.stringify(positions)}). Provide one tray per used filament, or use amsMapping for a raw project-level array.`);
             }
-            for (const v of options.amsMapping) {
-                if (!Number.isInteger(v) || v < -1 || v > 3) {
-                    throw new Error(`ams_mapping values must be integers in [-1, 3] (AMS slot index or -1 for unused); got ${v}`);
-                }
-            }
-            amsMapping = Array.from({ length: 5 }, (_, i) => i < options.amsMapping.length ? options.amsMapping[i] : -1);
+            const projectLen = Math.max(projectMetadata.projectFilamentCount, ...positions.map((p) => p + 1));
+            baseMapping = Array(projectLen).fill(-1);
+            positions.forEach((pos, i) => {
+                baseMapping[pos] = options.amsSlots[i];
+            });
         }
         else {
-            amsMapping = [0, -1, -1, -1, -1];
+            // Default: pull each used filament from AMS 0 slots 0..n in order.
+            const positions = projectMetadata.usedFilamentPositions;
+            const projectLen = Math.max(projectMetadata.projectFilamentCount, ...positions.map((p) => p + 1), 1);
+            baseMapping = Array(projectLen).fill(-1);
+            positions.forEach((pos, i) => {
+                baseMapping[pos] = i; // AMS 0 slot i
+            });
         }
-        const projectFileCmd = {
-            print: {
-                command: "project_file",
-                param: `Metadata/${projectMetadata.plateFileName}`,
-                url: projectUrl,
-                file: isH2 ? remoteFileName : undefined,
-                subtask_name: isH2 ? remoteFileName : options.projectName,
-                md5,
-                flow_cali: options.flowCalibration ?? true,
-                layer_inspect: options.layerInspect ?? true,
-                vibration_cali: options.vibrationCalibration ?? true,
-                bed_leveling: options.bedLeveling ?? true,
-                bed_type: options.bedType || "textured_plate",
-                timelapse: options.timelapse ?? false,
-                use_ams: options.useAMS !== false,
-                ams_mapping: amsMapping,
-                profile_id: "0",
-                project_id: "0",
-                sequence_id: "0",
-                subtask_id: "0",
-                task_id: "0",
-            },
-        };
+        let amsMapping;
+        let amsMapping2;
+        if (isH2) {
+            // baseMapping is already project-level length from amsSlots/default
+            // expansion above. If a raw amsMapping was passed shorter than the
+            // project's declared filament count, pad with -1 -- H2 firmware
+            // rejects a mapping that can't address every declared slot.
+            const projLen = Math.max(projectMetadata.projectFilamentCount, baseMapping.length, 1);
+            amsMapping = Array.from({ length: projLen }, (_, i) => i < baseMapping.length ? baseMapping[i] : -1);
+            amsMapping2 = amsMapping.map((v) => {
+                if (v < 0 || v === 255)
+                    return { ams_id: 255, slot_id: 255 };
+                if (v >= 128)
+                    return { ams_id: 128, slot_id: v - 128 }; // AMS-HT
+                if (v === 254)
+                    return { ams_id: 254, slot_id: 254 }; // external
+                return { ams_id: Math.floor(v / 4), slot_id: v % 4 };
+            });
+        }
+        else {
+            amsMapping = Array.from({ length: 5 }, (_, i) => i < baseMapping.length ? baseMapping[i] : -1);
+            amsMapping2 = [];
+        }
+        const b = (v) => (v ? 1 : 0);
+        let projectFileCmd;
+        if (isH2) {
+            // H2-series payload shape per maziggy/bambuddy start_print() (real
+            // reference with a committed fix for 0700_8012 "Failed to get AMS
+            // mapping table" on H2D Pro). Critical rules:
+            //   - ams_mapping length == len(filament_ids), not padded to 5
+            //   - ams_mapping values = absolute global tray index
+            //     (ams_id = v>>2, slot_id = v&3). External/virtual spool must be
+            //     sent as -1 here, NOT 254/255 -- raw 254/255 triggers 0700_8012.
+            //   - ams_mapping2 is the parallel {ams_id, slot_id} array the H2
+            //     firmware actually reads. For external: {255,255}.
+            //   - calibration flags are int 0/1, but use_ams stays boolean
+            //     (int use_ams is parsed as a nozzle index on H2D and breaks).
+            //   - task/project/subtask IDs must be a shared int32-capped token,
+            //     not "0". No task_type / plate / nozzle_mapping /
+            //     toolhead_offset_cali fields.
+            const submissionId = String(Date.now() & 0x7fffffff);
+            projectFileCmd = {
+                print: {
+                    sequence_id: "0",
+                    command: "project_file",
+                    param: `Metadata/${projectMetadata.plateFileName}`,
+                    url: projectUrl,
+                    file: remoteFileName,
+                    md5,
+                    bed_type: options.bedType || "auto",
+                    timelapse: b(options.timelapse),
+                    bed_leveling: b(options.bedLeveling ?? true),
+                    auto_bed_leveling: 1,
+                    flow_cali: b(options.flowCalibration ?? false),
+                    vibration_cali: b(options.vibrationCalibration ?? true),
+                    layer_inspect: b(options.layerInspect ?? false),
+                    use_ams: options.useAMS !== false,
+                    cfg: "0",
+                    extrude_cali_flag: 0,
+                    extrude_cali_manual_mode: 0,
+                    nozzle_offset_cali: 2,
+                    subtask_name: remoteFileName.replace(/\.3mf$/i, ""),
+                    profile_id: "0",
+                    project_id: submissionId,
+                    subtask_id: submissionId,
+                    task_id: submissionId,
+                    ams_mapping: amsMapping,
+                    ams_mapping2: amsMapping2,
+                },
+            };
+        }
+        else {
+            projectFileCmd = {
+                print: {
+                    command: "project_file",
+                    param: `Metadata/${projectMetadata.plateFileName}`,
+                    url: projectUrl,
+                    subtask_name: options.projectName,
+                    md5,
+                    flow_cali: options.flowCalibration ?? true,
+                    layer_inspect: options.layerInspect ?? true,
+                    vibration_cali: options.vibrationCalibration ?? true,
+                    bed_leveling: options.bedLeveling ?? true,
+                    bed_type: options.bedType || "textured_plate",
+                    timelapse: options.timelapse ?? false,
+                    use_ams: options.useAMS !== false,
+                    ams_mapping: amsMapping,
+                    profile_id: "0",
+                    project_id: "0",
+                    sequence_id: "0",
+                    subtask_id: "0",
+                    task_id: "0",
+                },
+            };
+        }
         await printer.publish(projectFileCmd);
         await new Promise((resolve) => setTimeout(resolve, 300));
         return {

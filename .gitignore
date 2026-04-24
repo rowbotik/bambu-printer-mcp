@@ -9,3 +9,5 @@ temp/
 .idea/
 .vscode/
 coverage/
+certs/bambu/*
+!certs/bambu/README.md

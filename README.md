@@ -14,8 +14,8 @@ This is a fork of [DMontgomery40/bambu-printer-mcp](https://github.com/DMontgome
 ### What this fork adds
 
 - **H2S and H2D support.** These printers never respond to the `get_version` MQTT handshake that the underlying `bambu-node` library uses for model detection. This fork detects the model from the serial number prefix instead (`093` → H2S, `094` → H2D) and skips the handshake entirely, so the connection succeeds and status polling works correctly.
-- **mTLS for post-Jan-2025 H2D firmware.** Newer H2D firmware requires a Bambu-issued client certificate for MQTT and FTPS. Place `embedded-cert.pem` and `embedded-key.pem` in `~/Desktop/bambu certs/` (or point `BAMBU_CLIENT_CERT` / `BAMBU_CLIENT_KEY` at them) and the server will use them automatically.
-- **Pre-sliced `.gcode.3mf` support.** Files exported from BambuStudio as "Plate Sliced File" (`.gcode.3mf`) are now detected and started with `gcode_file` instead of `project_file`, avoiding the 405004002 parse error that occurred when the printer tried to read them as full project files.
+- **Access-code LAN auth for current verified workflows, with optional local cert support.** Current verified H2S/H2D LAN flows use the printer access code over TLS. If a target firmware requires client certificates, place them in `certs/bambu/` or point `BAMBU_CLIENT_CERT` / `BAMBU_CLIENT_KEY` at machine-local paths.
+- **Pre-sliced `.gcode.3mf` support across firmware generations.** Files exported from BambuStudio as "Plate Sliced File" (`.gcode.3mf`) are routed automatically: P1/A1/X1-series printers use `gcode_file`, while H2S/H2D use `project_file` with H2-specific AMS metadata.
 
 <details>
 <summary><strong>Click to expand Table of Contents</strong></summary>
@@ -157,6 +157,11 @@ SLICER_PATH=/Applications/BambuStudio.app/Contents/MacOS/BambuStudio
 # Alias also accepted: BAMBU_STUDIO_PATH
 SLICER_PROFILE=                   # Optional: path to a slicer profile/config file
 
+# --- Optional client certificate paths for firmware that requires mTLS ---
+# Default: ./certs/bambu/embedded-cert.pem and ./certs/bambu/embedded-key.pem
+BAMBU_CLIENT_CERT=
+BAMBU_CLIENT_KEY=
+
 # --- Temporary file directory ---
 TEMP_DIR=/tmp/bambu-mcp-temp      # Directory for intermediate files. Created automatically if absent.
 
@@ -188,6 +193,8 @@ BLENDER_MCP_BRIDGE_COMMAND=       # Shell command to invoke your Blender MCP bri
 | `SLICER_TYPE` | `bambustudio` | No | Slicer to use for slicing operations |
 | `SLICER_PATH` | BambuStudio macOS path | No | Full path to the slicer executable. Alias: `BAMBU_STUDIO_PATH` |
 | `SLICER_PROFILE` | | No | Path to a slicer profile or config file |
+| `BAMBU_CLIENT_CERT` | `./certs/bambu/embedded-cert.pem` | No | Optional client certificate path for firmware that requires mTLS |
+| `BAMBU_CLIENT_KEY` | `./certs/bambu/embedded-key.pem` | No | Optional client private-key path for firmware that requires mTLS |
 | `TEMP_DIR` | `./temp` | No | Directory for intermediate files |
 | `MCP_TRANSPORT` | `stdio` | No | Transport mode: `stdio` or `streamable-http` |
 | `MCP_HTTP_HOST` | `127.0.0.1` | No | HTTP bind address (HTTP transport only) |
@@ -357,13 +364,18 @@ The Bambu AMS is a multi-spool feeder that lets you assign different filaments t
 
 The AMS has 4 slots per unit, numbered 0 through 3. If you have multiple AMS units chained together, the second unit's slots are 4 through 7, and so on. When you slice a model in Bambu Studio or OrcaSlicer, each color/material in the print is assigned to a specific AMS slot.
 
-### Automatic AMS mapping from the 3MF
+### Automatic AMS mapping from the sliced plate
 
-When you slice a model in Bambu Studio, the slicer embeds AMS mapping information inside the 3MF file at `Metadata/project_settings.config`. The `print_3mf` tool reads this file automatically and extracts the correct mapping. In most cases, you do not need to specify `ams_mapping` manually -- the tool handles it.
+For modern Bambu 3MFs, the printer-facing mapping is derived from the sliced plate metadata, not just one config blob. The important inputs are:
+
+- the project-level filament declaration length from the selected plate's gcode header (`; filament_colour = ...` or `; filament_ids = ...`)
+- the selected plate's used filament positions from `Metadata/plate_<n>.json.filament_ids`
+
+The `print_3mf` tool reads those values automatically and builds the correct mapping for the target printer family. In most cases you should prefer `ams_slots` over raw `ams_mapping`: pass one absolute tray index per used filament in plate order, and the server expands it to the required project-level mapping.
 
 ### Manual AMS mapping
 
-If you need to override the embedded mapping (for example, you swapped filament positions since slicing), pass the `ams_mapping` array to `print_3mf`:
+If you need to override the automatic mapping (for example, you swapped filament positions since slicing), pass the `ams_mapping` array to `print_3mf`:
 
 ```json
 {
@@ -373,22 +385,22 @@ If you need to override the embedded mapping (for example, you swapped filament 
 }
 ```
 
-Each element in the array corresponds to a filament slot used in the print file, in the order they appear in the slicer. The value is the physical AMS slot number (0-based) where that filament is currently loaded. In the example above, the first filament in the print uses AMS slot 0, and the second uses AMS slot 2.
+For P1/A1/X1-series printers, each element in the array is the project-level filament index and the value is the physical AMS slot number (0-based). The server pads this array to the 5 elements required by that firmware family, so `[0, 2]` becomes `[0, 2, -1, -1, -1]`.
 
-The server pads this array to the 5 elements required by the printer's MQTT protocol. An `ams_mapping` of `[0, 2]` becomes `[0, 2, -1, -1, -1]` on the wire, where `-1` indicates unused positions.
+For H2S/H2D, the array length must match the project-level filament declaration length in the sliced file, and populated positions must line up with `plate_<n>.json.filament_ids`. The server also sends the parallel `ams_mapping2` object array that H2 firmware actually reads.
 
 ### Single-material prints
 
-For a single-material print (the most common case), the default mapping is `[-1, -1, -1, -1, 0]`, which tells the printer to pull filament from AMS slot 0. If your filament is in a different slot, specify it:
+For a single-material print (the most common case), the easiest override is `ams_slots`: pass one tray index for the one used filament:
 
 ```json
 {
   "three_mf_path": "/path/to/model.3mf",
-  "ams_mapping": [2]
+  "ams_slots": [2]
 }
 ```
 
-This tells the printer to use AMS slot 2 for the single filament in the print.
+This tells the server to route the used filament for that plate to absolute tray 2 and expand the printer-specific mapping automatically.
 
 ### Printing without AMS
 
@@ -452,22 +464,23 @@ The `bambu-js` library's project file command hardcodes `use_ams: true` and does
 
 According to the OpenBambuAPI spec, `ams_mapping` is a 5-element array where **position `i` is the filament index in the print file** and **the value is the AMS slot (0-3)** that feeds that filament, or `-1` if the filament is not sourced from the AMS. A single-filament print that pulls from AMS slot 0 sends `[0, -1, -1, -1, -1]` -- **not** `[-1, -1, -1, -1, 0]` (that would route filament index 4 to slot 0 and leave filament 0 unmapped).
 
-This fork sends the `project_file` command directly via `bambu-node` (bypassing `bambu-js` entirely for print initiation), validates each mapping value is in `[-1, 3]`, and constructs the array correctly:
+This fork sends the `project_file` command directly via `bambu-node` (bypassing `bambu-js` entirely for print initiation) and constructs the mapping in the format the target firmware actually expects:
 
 ```typescript
-// From src/printers/bambu.ts
-let amsMapping: number[];
-if (options.amsMapping && options.amsMapping.length > 0) {
-  // validates length <= 5 and values in [-1, 3]
-  amsMapping = Array.from({ length: 5 }, (_, i) =>
-    i < options.amsMapping!.length ? options.amsMapping![i] : -1
-  );
-} else {
-  amsMapping = [0, -1, -1, -1, -1];  // default: filament 0 <- AMS slot 0
-}
+// P1/A1/X1-series: 5-element project lookup table
+ams_mapping = [0, -1, -1, -1, -1];
+
+// H2S/H2D: project-length lookup table + parallel ams_mapping2
+ams_mapping = [-1, 1, -1, -1];
+ams_mapping2 = [
+  { ams_id: 255, slot_id: 255 },
+  { ams_id: 0, slot_id: 1 },
+  { ams_id: 255, slot_id: 255 },
+  { ams_id: 255, slot_id: 255 }
+];
 ```
 
-**AMS-equipped printers (H2S, X1C with AMS, etc.):** you must send `use_ams: true` with a valid `ams_mapping` whenever the 3MF declares filaments, even if you conceptually think of the print as "no AMS." The firmware looks up the mapping table unconditionally; if the lookup fails you get **`Print Stopped -- Failed to get AMS mapping table [0700-8012-032015]`** on the touchscreen. Setting `use_ams: false` does **not** skip the lookup on these models.
+**AMS-equipped printers (H2S, X1C with AMS, etc.):** you must send `use_ams: true` with a valid mapping whenever the 3MF declares filaments, even if you conceptually think of the print as "no AMS." The firmware looks up the mapping table unconditionally; if the lookup fails you get **`Print Stopped -- Failed to get AMS mapping table [0700-8012-032015]`** on the touchscreen. Setting `use_ams: false` does **not** skip the lookup on these models.
 
 The command payload also includes all required fields per the OpenBambuAPI spec: `param` (the internal gcode path within the 3MF), `url` (the sdcard path), `md5` (computed from the plate's embedded gcode), and all calibration flags.
 
@@ -533,7 +546,7 @@ This is the sequence that successfully started a print on an H2S running current
 - `param` uses the internal plate path inside the 3MF (`Metadata/plate_1.gcode` for plate 1), not a filesystem path.
 - `md5: ""` is accepted; populating it is optional.
 - **H2S and other AMS-equipped printers require `use_ams: true` plus a valid `ams_mapping` whenever the 3MF declares filaments.** Sending `use_ams: false` on an H2S stops the print with `Failed to get AMS mapping table [0700-8012-032015]` because the firmware still looks up the mapping. For a single-filament print from AMS slot 0, send `use_ams: true` and `ams_mapping: [0, -1, -1, -1, -1]`. Only set `use_ams: false` on printers that have no AMS at all (e.g. base A1 mini without AMS lite).
-- No client X.509 certificate was needed. The earlier assumption that post-Jan 2025 firmware mandates mTLS on all models does not hold for the H2S in LAN mode — user/password over TLS is sufficient.
+- No client X.509 certificate was needed for this verified H2S LAN-mode flow. Certificate-based auth remains a deferred path to revisit only if a target printer firmware requires it.
 - The MCP server's `ftpUpload` helper (basic-ftp with `secure: "implicit"` and a short idle timeout) performs the equivalent upload natively and is the preferred path when using the server itself; the curl form is the manual-debug equivalent.
 
 ---
@@ -756,9 +769,9 @@ The primary tool for starting a Bambu print. This tool handles the complete work
 1. Checks whether the 3MF contains embedded G-code (`Metadata/plate_<n>.gcode` entries).
 2. If no G-code is found, automatically slices the file using the configured slicer before proceeding.
 3. Parses the sliced 3MF to extract the correct plate file and compute its MD5 hash.
-4. Also parses `Metadata/project_settings.config` to read AMS mapping embedded by Bambu Studio.
+4. Parses the sliced plate metadata to determine project filament count, used filament positions, and the correct AMS mapping layout for the target printer family.
 5. Uploads the 3MF to the printer's `cache/` directory via FTPS using `basic-ftp` directly (avoiding the bambu-js double-path bug).
-6. Sends a `project_file` MQTT command with the plate path, MD5, AMS mapping (formatted as a 5-element array per the OpenBambuAPI spec), and calibration flags.
+6. Sends the correct MQTT print command for the target printer family. For H2S/H2D that means `project_file` with project-length `ams_mapping`, parallel `ams_mapping2`, and H2-compatible calibration flags.
 
 ```json
 {
@@ -779,7 +792,7 @@ The primary tool for starting a Bambu print. This tool handles the complete work
 
 `bambu_model` is **required** -- it ensures the slicer generates G-code for the correct printer. Using the wrong model can cause the bed to crash into the nozzle. If `bambu_model` is not provided in the tool call and `BAMBU_MODEL` is not set in the environment, the server will ask you interactively via MCP elicitation (if your client supports it) or return a clear error.
 
-`bed_type` defaults to `textured_plate` if omitted. AMS mapping from the 3MF's slicer config is used automatically when present; the `ams_mapping` argument overrides it. Setting `use_ams: false` disables AMS entirely regardless of other mapping values.
+`bed_type` defaults to `textured_plate` if omitted. `ams_slots` is the preferred override input; `ams_mapping` remains the raw escape hatch. On AMS-equipped printers, `use_ams: false` does not suppress mapping lookup if the sliced file declares filaments.
 
 Layer height, nozzle temperature, and other slicer parameters cannot be overridden via this tool -- they are baked into the 3MF's G-code at slice time. Apply those settings in your slicer before generating the 3MF.
 
@@ -837,7 +850,7 @@ Slice an STL or 3MF using a named template from the local registry. This is a hi
 }
 ```
 
-This uses the named template as the slicing profile source and still supports live printer filament selection unless you explicitly override `load_filaments`.
+This uses the named template as the slicing profile source and still supports live printer filament selection unless you explicitly override `load_filaments`. The template's slicer settings are applied at slice time, and the later `print_3mf` step computes AMS mapping from the newly sliced output.
 
 #### slice_stl
 
@@ -1001,7 +1014,7 @@ After connecting the MCP server in Claude Desktop or Claude Code, you can ask Cl
 
 Understanding these constraints will help you avoid frustrating errors and set appropriate expectations.
 
-1. **Printable 3MF required for print_3mf.** The `print_3mf` tool expects a sliced 3MF containing at least one `Metadata/plate_<n>.gcode` entry. If you pass an unsliced 3MF (one exported from a CAD tool without slicing), the server will attempt to auto-slice it using the configured slicer. If auto-slicing fails, the tool errors out rather than sending an incomplete command to the printer. Pre-sliced `.gcode.3mf` files (exported from BambuStudio as "Plate Sliced File") are supported directly and bypass the project file path entirely.
+1. **Printable 3MF required for print_3mf.** The `print_3mf` tool expects a sliced 3MF containing at least one `Metadata/plate_<n>.gcode` entry. If you pass an unsliced 3MF (one exported from a CAD tool without slicing), the server will attempt to auto-slice it using the configured slicer. If auto-slicing fails, the tool errors out rather than sending an incomplete command to the printer. Pre-sliced `.gcode.3mf` files are supported directly, but the start command differs by printer family: P1/A1/X1 use `gcode_file`, while H2S/H2D use `project_file`.
 
 2. **Layer height, temperature, and slicer settings are baked in.** The `project_file` MQTT command tells the printer which plate to run. It does not support overriding layer height, temperature targets, infill percentage, or other slicing parameters at print time. These must be set in your slicer before generating the 3MF.
 
