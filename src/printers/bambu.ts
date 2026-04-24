@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import JSZip from "jszip";
 import { Client as FTPClient } from "basic-ftp";
 import { BambuPrinter } from "bambu-js";
+import * as mqtt from "mqtt";
 import {
   BambuClient,
   GCodeFileCommand,
@@ -11,6 +14,42 @@ import {
   PushAllCommand,
   UpdateStateCommand,
 } from "bambu-node";
+
+/**
+ * Post-Jan-2025 H2D firmware requires mTLS with a Bambu-issued client cert.
+ * Loads cert+key once from:
+ *   - BAMBU_CLIENT_CERT / BAMBU_CLIENT_KEY env vars (paths), or
+ *   - ~/Desktop/bambu certs/embedded-cert.pem + embedded-key.pem (default)
+ * Returns null if files missing — caller falls back to no-cert TLS.
+ */
+function loadClientCreds(): { cert: Buffer; key: Buffer } | null {
+  const defaultDir = path.join(os.homedir(), "Desktop", "bambu certs");
+  const certPath = process.env.BAMBU_CLIENT_CERT || path.join(defaultDir, "embedded-cert.pem");
+  const keyPath = process.env.BAMBU_CLIENT_KEY || path.join(defaultDir, "embedded-key.pem");
+  try {
+    if (!existsSync(certPath) || !existsSync(keyPath)) return null;
+    return { cert: readFileSync(certPath), key: readFileSync(keyPath) };
+  } catch {
+    return null;
+  }
+}
+
+const CLIENT_CREDS = loadClientCreds();
+
+const COMMAND_SETTLE_MS = 300;
+
+const MODEL_ID_TO_NAME: Record<string, string> = {
+  O1D: "H2D",
+  O1E: "H2D Pro",
+  O1S: "H2S",
+  N2S: "A1",
+  A1M: "A1 Mini",
+  C11: "P1P",
+  C12: "P1S",
+  "BL-P001": "X1C",
+  "BL-P002": "X1",
+  C13: "X1E",
+};
 
 interface BambuPrintOptionsInternal {
   projectName: string;
@@ -24,6 +63,15 @@ interface BambuPrintOptionsInternal {
   layerInspect?: boolean;
   timelapse?: boolean;
   amsMapping?: number[];
+  /**
+   * Per-used-filament absolute tray index, one entry per position in the
+   * selected plate's `filament_ids`. Example: plate uses project filament 1
+   * only, and you want to pull from AMS 0 tray 1 -> pass `[1]`. The server
+   * expands this into the project-level `ams_mapping` array at the right
+   * position automatically (H2-series). Preferred over `amsMapping` for
+   * ergonomic callers; `amsMapping` takes precedence if both are set.
+   */
+  amsSlots?: number[];
   md5?: string;
 }
 
@@ -31,14 +79,226 @@ interface ProjectFileMetadata {
   plateFileName: string;
   plateInternalPath: string;
   md5: string;
+  /** Number of filament slots declared at project level (length the H2
+   * firmware expects for `ams_mapping`). Parsed from the gcode header
+   * `; filament_colour = ...` list. */
+  projectFilamentCount: number;
+  /** 0-based positions in the project filament list that the selected plate
+   * actually uses, from `Metadata/plate_<n>.json.filament_ids`. For a
+   * single-filament cube that pulls only project filament 1, this is `[1]`. */
+  usedFilamentPositions: number[];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveModelName(data: Record<string, any>): string {
+  const modelId = `${data?.model_id ?? ""}`.toUpperCase();
+  return (
+    MODEL_ID_TO_NAME[modelId] ||
+    data?.model ||
+    data?.device?.devModel ||
+    data?.device?.dev_model ||
+    "Unknown"
+  );
+}
+
+async function invokeWithoutAck(printer: BambuClient, command: { invoke(client: BambuClient): Promise<void> }) {
+  await command.invoke(printer);
+  await sleep(COMMAND_SETTLE_MS);
+}
+
+function getPrinterKey(host: string, serial: string, token: string): string {
+  return `${host}-${serial}-${token}`;
+}
+
+class TolerantBambuClient extends BambuClient {
+  /**
+   * H2D-class firmware streams push status immediately after subscribe, but
+   * never answers bambu-node's initial get_version round-trip. Avoid treating
+   * that missing ACK as a failed connection.
+   */
+  protected override async onConnect(): Promise<void> {
+    const subscribe = (this as any).subscribe.bind(this);
+    await subscribe(`device/${this.config.serialNumber}/report`);
+  }
+
+  /**
+   * H2S/H2D printers don't respond to get_version with module info.
+   * Infer model from serial number prefix so downstream code (Job, status
+   * parsing, etc.) has a valid printerModel instead of undefined.
+   */
+  private inferModelFromSerial(): string | undefined {
+    const sn = this.config.serialNumber;
+    if (sn.startsWith("093")) return "H2S";
+    if (sn.startsWith("094")) return "H2D";
+    if (sn.startsWith("00M")) return "X1C";
+    if (sn.startsWith("00W")) return "X1";
+    if (sn.startsWith("03W")) return "X1E";
+    if (sn.startsWith("01S")) return "P1P";
+    if (sn.startsWith("01P")) return "P1S";
+    if (sn.startsWith("030")) return "A1";
+    if (sn.startsWith("039")) return "A1M";
+    return undefined;
+  }
+
+  /**
+   * Override bambu-node's MQTT connect to pass a client cert+key for mTLS.
+   * Post-Jan-2025 H2D firmware rejects TLS handshakes without a valid Bambu-
+   * issued client certificate. Options mirror the upstream implementation
+   * plus `cert`/`key` when creds are available.
+   */
+  override async connect(): Promise<[void]> {
+    await new Promise<void>((resolve, reject) => {
+      const self: any = this;
+      if (self.mqttClient) {
+        throw new Error("Can't establish a new connection while running another one!");
+      }
+      const tlsOpts: Record<string, unknown> = {
+        username: "bblp",
+        password: self.config.accessToken,
+        reconnectPeriod: self.clientOptions.reconnectInterval,
+        connectTimeout: self.clientOptions.connectTimeout,
+        keepalive: self.clientOptions.keepAlive,
+        resubscribe: true,
+        rejectUnauthorized: false,
+      };
+      if (CLIENT_CREDS) {
+        tlsOpts.cert = CLIENT_CREDS.cert;
+        tlsOpts.key = CLIENT_CREDS.key;
+      }
+      const client = mqtt.connect(
+        `mqtts://${self.config.host}:${self.config.port}`,
+        tlsOpts as any
+      );
+      self.mqttClient = client;
+      client.on("connect", async (...args: any[]) => {
+        try {
+          await self.onConnect(...args);
+          self.emit("client:connect");
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+      client.on("disconnect", () => {
+        self.emit("client:disconnect", false);
+        self.emit("printer:statusUpdate", self._printerStatus, "OFFLINE");
+        self._printerStatus = "OFFLINE";
+        if (self.currentJob) self.emit("job:pause", self.currentJob, true);
+      });
+      client.on("offline", () => {
+        self.emit("client:disconnect", true);
+        self.emit("printer:statusUpdate", self._printerStatus, "OFFLINE");
+        self._printerStatus = "OFFLINE";
+        if (self.currentJob) self.emit("job:pause", self.currentJob, true);
+      });
+      client.on("message", (topic: string, payload: Buffer) =>
+        self.emit("rawMessage", topic, payload)
+      );
+      client.on("error", (err: Error) => {
+        self.emit("client:error", err);
+        reject(err);
+      });
+    });
+    // H2S/H2D printers don't respond to get_version with module info.
+    // Infer model from serial number prefix so downstream code works.
+    if (!this.data.model) {
+      const inferred = this.inferModelFromSerial();
+      if (inferred) {
+        (this.data as any).model = inferred;
+        this.emit("printer:dataUpdate", this.data, { model: inferred } as any);
+      }
+    }
+    return [undefined as unknown as void];
+  }
+}
+
+/** Build FTPS secureOptions that include the client cert+key when available. */
+function ftpsSecureOptions(): Record<string, unknown> {
+  const opts: Record<string, unknown> = { rejectUnauthorized: false };
+  if (CLIENT_CREDS) {
+    opts.cert = CLIENT_CREDS.cert;
+    opts.key = CLIENT_CREDS.key;
+  }
+  return opts;
 }
 
 class BambuClientStore {
   private printers: Map<string, BambuClient> = new Map();
   private initialConnectionPromises: Map<string, Promise<void>> = new Map();
+  private reportSnapshots: Map<string, Record<string, any>> = new Map();
+  private initialReportPromises: Map<string, Promise<void>> = new Map();
+  private initialReportResolvers: Map<string, () => void> = new Map();
+
+  private ensureInitialReportPromise(key: string): Promise<void> {
+    const existing = this.initialReportPromises.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = new Promise<void>((resolve) => {
+      this.initialReportResolvers.set(key, resolve);
+    });
+    this.initialReportPromises.set(key, promise);
+    return promise;
+  }
+
+  private resolveInitialReport(key: string): void {
+    const resolve = this.initialReportResolvers.get(key);
+    if (!resolve) {
+      return;
+    }
+
+    this.initialReportResolvers.delete(key);
+    resolve();
+  }
+
+  private updateReportSnapshot(key: string, update: Record<string, any>): void {
+    if (!update || Object.keys(update).length === 0) {
+      return;
+    }
+
+    const previous = this.reportSnapshots.get(key) || {};
+    this.reportSnapshots.set(key, { ...previous, ...update });
+    this.resolveInitialReport(key);
+  }
+
+  getCachedReport(host: string, serial: string, token: string): Record<string, any> | null {
+    return this.reportSnapshots.get(getPrinterKey(host, serial, token)) || null;
+  }
+
+  async waitForInitialReport(
+    host: string,
+    serial: string,
+    token: string,
+    timeoutMs = 4000
+  ): Promise<Record<string, any> | null> {
+    const key = getPrinterKey(host, serial, token);
+    const existing = this.reportSnapshots.get(key);
+    if (existing && Object.keys(existing).length > 0) {
+      return existing;
+    }
+
+    const reportPromise = this.ensureInitialReportPromise(key);
+
+    try {
+      await Promise.race([
+        reportPromise,
+        sleep(timeoutMs).then(() => {
+          throw new Error(`Timed out waiting for initial printer report after ${timeoutMs}ms.`);
+        }),
+      ]);
+    } catch (error) {
+      console.warn(`No initial printer report received for ${serial}:`, error);
+    }
+
+    return this.reportSnapshots.get(key) || null;
+  }
 
   async getPrinter(host: string, serial: string, token: string): Promise<BambuClient> {
-    const key = `${host}-${serial}`;
+    const key = getPrinterKey(host, serial, token);
 
     if (this.printers.has(key)) {
       return this.printers.get(key)!;
@@ -52,10 +312,27 @@ class BambuClientStore {
       throw new Error(`Existing Bambu client connection for ${key} failed.`);
     }
 
-    const printer = new BambuClient({
+    const printer = new TolerantBambuClient({
       host,
       serialNumber: serial,
       accessToken: token,
+    });
+    this.ensureInitialReportPromise(key);
+
+    printer.on("rawMessage", (_topic, payload) => {
+      try {
+        const parsed = JSON.parse(payload.toString());
+        const printMessage = parsed?.print;
+        if (printMessage && typeof printMessage === "object") {
+          this.updateReportSnapshot(key, printMessage);
+        }
+      } catch {
+        // Ignore unrelated payloads.
+      }
+    });
+
+    printer.on("printer:dataUpdate", (data) => {
+      this.updateReportSnapshot(key, data);
     });
 
     printer.on("client:connect", () => {
@@ -66,11 +343,15 @@ class BambuClientStore {
     printer.on("client:error", () => {
       this.printers.delete(key);
       this.initialConnectionPromises.delete(key);
+      this.initialReportPromises.delete(key);
+      this.initialReportResolvers.delete(key);
     });
 
     printer.on("client:disconnect", () => {
       this.printers.delete(key);
       this.initialConnectionPromises.delete(key);
+      this.initialReportPromises.delete(key);
+      this.initialReportResolvers.delete(key);
     });
 
     const connectPromise = printer.connect().then(() => {});
@@ -103,6 +384,8 @@ class BambuClientStore {
     await Promise.allSettled(disconnectPromises);
     this.printers.clear();
     this.initialConnectionPromises.clear();
+    this.initialReportPromises.clear();
+    this.initialReportResolvers.clear();
   }
 }
 
@@ -155,10 +438,51 @@ export class BambuImplementation {
     const gcodeBuffer = await selectedEntry.async("nodebuffer");
     const md5 = createHash("md5").update(gcodeBuffer).digest("hex");
 
+    // Project filament count: parse the gcode header line
+    // `; filament_colour = #FFFFFF;#FF911A80;#DCF478;#DCF478`
+    // This is the authoritative source -- it always reflects the slicer's
+    // project filament list length. We only scan the first ~32KB of the
+    // gcode to keep this cheap even on large plates.
+    let projectFilamentCount = 1;
+    const head = gcodeBuffer.slice(0, 32 * 1024).toString("utf8");
+    const colourLine = head.match(/;\s*filament_colour\s*=\s*([^\n\r]+)/i);
+    if (colourLine) {
+      projectFilamentCount = colourLine[1].split(";").filter((s) => s.trim()).length;
+    } else {
+      // Fallback: count filament_ids header entries.
+      const idsLine = head.match(/;\s*filament_ids\s*=\s*([^\n\r]+)/i);
+      if (idsLine) {
+        projectFilamentCount = idsLine[1].split(";").filter((s) => s.trim()).length;
+      }
+    }
+
+    // Used filament positions: from Metadata/plate_<n>.json.filament_ids.
+    // These are 0-based positions into the project filament list that the
+    // selected plate actually consumes.
+    let usedFilamentPositions: number[] = [];
+    const plateJsonName = selectedEntry.name.replace(/\.gcode$/i, ".json");
+    const plateJsonEntry = zip.file(plateJsonName);
+    if (plateJsonEntry) {
+      try {
+        const raw = await plateJsonEntry.async("string");
+        const json = JSON.parse(raw);
+        if (Array.isArray(json.filament_ids)) {
+          usedFilamentPositions = json.filament_ids
+            .filter((n: unknown) => Number.isInteger(n))
+            .map((n: number) => n);
+        }
+      } catch {
+        // tolerate malformed plate_N.json -- caller can pass amsMapping directly
+      }
+    }
+    if (usedFilamentPositions.length === 0) usedFilamentPositions = [0];
+
     return {
       plateFileName: path.posix.basename(selectedEntry.name),
       plateInternalPath: selectedEntry.name,
       md5,
+      projectFilamentCount,
+      usedFilamentPositions,
     };
   }
 
@@ -167,16 +491,16 @@ export class BambuImplementation {
       const printer = await this.getPrinter(host, serial, token);
 
       try {
-        await printer.executeCommand(new PushAllCommand());
+        await invokeWithoutAck(printer, new PushAllCommand());
       } catch (error) {
         console.warn("PushAllCommand failed, continuing with cached status", error);
       }
 
-      if (!printer.data || Object.keys(printer.data).length === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-
-      const data = printer.data;
+      const cachedData = await this.printerStore.waitForInitialReport(host, serial, token);
+      const data =
+        cachedData && Object.keys(cachedData).length > 0
+          ? cachedData
+          : printer.data;
 
       return {
         status: data.gcode_state || "UNKNOWN",
@@ -200,7 +524,7 @@ export class BambuImplementation {
           totalLayers: data.total_layer_num || 0,
         },
         ams: data.ams || null,
-        model: data.model || "Unknown",
+        model: resolveModelName(data),
         serial,
         raw: data,
       };
@@ -220,55 +544,195 @@ export class BambuImplementation {
       throw new Error("print3mf requires a .3mf input file.");
     }
 
+    // Normalise remote filename: collapse double-extension artifacts like
+    // "Cube.gcode.3mf.gcode.3mf" -> "Cube.gcode.3mf" so firmware can identify
+    // the container format from the extension.
+    let remoteFileName = path.basename(options.filePath);
+    remoteFileName = remoteFileName.replace(/\.gcode\.3mf\.gcode\.3mf$/i, ".gcode.3mf");
+
+    // H2S/H2D land files at the FTP root and reference them via ftp:///<name>.
+    // P1/A1/X1 use /cache/<name> and file:///sdcard/cache/<name>.
+    const isH2 = serial.startsWith("093") || serial.startsWith("094");
+    const remoteProjectPath = isH2 ? remoteFileName : `cache/${remoteFileName}`;
+    const remoteUploadPath = isH2 ? `/${remoteFileName}` : `/cache/${remoteFileName}`;
+    const projectUrl = isH2
+      ? `ftp:///${remoteFileName}`
+      : `file:///sdcard/${remoteProjectPath}`;
+
+    // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
+    await this.ftpUpload(host, token, options.filePath, remoteUploadPath);
+
+    // Pre-sliced .gcode.3mf files: routing depends on firmware generation.
+    // P1/A1/X1 series: project_file returns 405004002 for .gcode.3mf (firmware
+    // doesn't recognise the container), so use gcode_file instead.
+    // H2S/H2D: gcode_file is not supported; project_file works because the
+    // firmware can open the zip and find Metadata/plate_<n>.gcode directly.
+    if (options.filePath.toLowerCase().endsWith(".gcode.3mf")) {
+      if (!isH2) {
+        const printer = await this.getPrinter(host, serial, token);
+        await invokeWithoutAck(printer, new GCodeFileCommand({ fileName: remoteProjectPath }));
+        return {
+          status: "success",
+          message: `Uploaded and started gcode.3mf print: ${options.projectName}`,
+          remoteProjectPath,
+        };
+      }
+      // H2S/H2D: fall through to project_file path below
+    }
+
     const projectMetadata = await this.resolveProjectFileMetadata(
       options.filePath,
       options.plateIndex
     );
-
-    const remoteFileName = path.basename(options.filePath);
-    const remoteProjectPath = `cache/${remoteFileName}`;
-
-    // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
-    await this.ftpUpload(host, token, options.filePath, `/cache/${remoteFileName}`);
 
     // Send project_file command via bambu-node MQTT (bypasses bambu-js
     // hardcoded use_ams=true and missing ams_mapping support)
     const printer = await this.getPrinter(host, serial, token);
     const md5 = options.md5 ?? projectMetadata.md5;
 
-    // Build AMS mapping per OpenBambuAPI spec: 5-element array
-    // [-1,-1,-1,-1,0] means slot 0 only; pad unused slots with -1
-    let amsMapping: number[];
+    // Build AMS mapping.
+    //
+    // Convention: position = project-level filament index, value = absolute
+    // tray index (0-3 = AMS 0 trays, 4-7 = AMS 1, 8-11 = AMS 2, 128+ = AMS-HT,
+    // 254 = external spool, -1 = unused). Required on AMS-equipped printers
+    // even when you think "no AMS" -- firmware looks up the mapping table
+    // whenever the 3MF declares filaments, and a missing/invalid mapping
+    // fails with 0700-8012-032015 "Failed to get AMS mapping table".
+    //
+    // For H2-series the array length MUST equal the project-level filament
+    // count declared by the slicer (parsed from the gcode header's
+    // `filament_colour` list). For P1/A1/X1 we pad to length 5 per the
+    // historical bambu-js behavior.
+    //
+    // Caller ergonomics: callers typically know only "I want to pull this
+    // print's filaments from these AMS slots" in the order the plate uses
+    // them. We expose `amsSlots` for that -- one entry per position in
+    // `plate_N.json.filament_ids` -- and expand to a full project-level
+    // array here. `amsMapping` is the raw escape hatch (takes precedence
+    // when both are supplied).
+    const validateTrayValue = (v: unknown, label: string): void => {
+      if (
+        !Number.isInteger(v) ||
+        (v as number) < -1 ||
+        ((v as number) > 15 && (v as number) < 128) ||
+        (v as number) > 254
+      ) {
+        throw new Error(
+          `${label} values must be integers in [-1, 15] (absolute tray) or 128-254 (HT/external); got ${v}`
+        );
+      }
+    };
+
+    let baseMapping: number[];
     if (options.amsMapping && options.amsMapping.length > 0) {
-      amsMapping = Array.from({ length: 5 }, (_, i) =>
-        i < options.amsMapping!.length ? options.amsMapping![i] : -1
+      for (const v of options.amsMapping) validateTrayValue(v, "ams_mapping");
+      baseMapping = options.amsMapping.slice();
+    } else if (options.amsSlots && options.amsSlots.length > 0) {
+      for (const v of options.amsSlots) validateTrayValue(v, "amsSlots");
+      const positions = projectMetadata.usedFilamentPositions;
+      if (options.amsSlots.length !== positions.length) {
+        throw new Error(
+          `amsSlots length ${options.amsSlots.length} does not match used filament count ${positions.length} (plate uses positions ${JSON.stringify(positions)}). Provide one tray per used filament, or use amsMapping for a raw project-level array.`
+        );
+      }
+      const projectLen = Math.max(
+        projectMetadata.projectFilamentCount,
+        ...positions.map((p) => p + 1)
       );
+      baseMapping = Array<number>(projectLen).fill(-1);
+      positions.forEach((pos, i) => {
+        baseMapping[pos] = options.amsSlots![i];
+      });
     } else {
-      amsMapping = [-1, -1, -1, -1, 0];
+      const positions = projectMetadata.usedFilamentPositions;
+      const projectLen = Math.max(
+        projectMetadata.projectFilamentCount,
+        ...positions.map((p) => p + 1),
+        1
+      );
+      baseMapping = Array<number>(projectLen).fill(-1);
+      positions.forEach((pos, i) => {
+        baseMapping[pos] = i;
+      });
     }
 
-    const projectFileCmd = {
-      print: {
-        command: "project_file",
-        param: `Metadata/${projectMetadata.plateFileName}`,
-        url: `file:///sdcard/${remoteProjectPath}`,
-        subtask_name: options.projectName,
-        md5,
-        flow_cali: options.flowCalibration ?? true,
-        layer_inspect: options.layerInspect ?? true,
-        vibration_cali: options.vibrationCalibration ?? true,
-        bed_leveling: options.bedLeveling ?? true,
-        bed_type: options.bedType || "textured_plate",
-        timelapse: options.timelapse ?? false,
-        use_ams: options.useAMS !== false,
-        ams_mapping: amsMapping,
-        profile_id: "0",
-        project_id: "0",
-        sequence_id: "0",
-        subtask_id: "0",
-        task_id: "0",
-      },
-    };
+    let amsMapping: number[];
+    let amsMapping2: Array<{ ams_id: number; slot_id: number }>;
+    if (isH2) {
+      const projLen = Math.max(projectMetadata.projectFilamentCount, baseMapping.length, 1);
+      amsMapping = Array.from({ length: projLen }, (_, i) =>
+        i < baseMapping.length ? baseMapping[i] : -1
+      );
+      amsMapping2 = amsMapping.map((v) => {
+        if (v < 0 || v === 255) return { ams_id: 255, slot_id: 255 };
+        if (v >= 128) return { ams_id: 128, slot_id: v - 128 };
+        if (v === 254) return { ams_id: 254, slot_id: 254 };
+        return { ams_id: Math.floor(v / 4), slot_id: v % 4 };
+      });
+    } else {
+      amsMapping = Array.from({ length: 5 }, (_, i) =>
+        i < baseMapping.length ? baseMapping[i] : -1
+      );
+      amsMapping2 = [];
+    }
+
+    const b = (v: any) => (v ? 1 : 0);
+    let projectFileCmd: Record<string, any>;
+    if (isH2) {
+      const submissionId = String(Date.now() & 0x7fffffff);
+      projectFileCmd = {
+        print: {
+          sequence_id: "0",
+          command: "project_file",
+          param: `Metadata/${projectMetadata.plateFileName}`,
+          url: projectUrl,
+          file: remoteFileName,
+          md5,
+          bed_type: options.bedType || "auto",
+          timelapse: b(options.timelapse),
+          bed_leveling: b(options.bedLeveling ?? true),
+          auto_bed_leveling: 1,
+          flow_cali: b(options.flowCalibration ?? false),
+          vibration_cali: b(options.vibrationCalibration ?? true),
+          layer_inspect: b(options.layerInspect ?? false),
+          use_ams: options.useAMS !== false,
+          cfg: "0",
+          extrude_cali_flag: 0,
+          extrude_cali_manual_mode: 0,
+          nozzle_offset_cali: 2,
+          subtask_name: remoteFileName.replace(/\.3mf$/i, ""),
+          profile_id: "0",
+          project_id: submissionId,
+          subtask_id: submissionId,
+          task_id: submissionId,
+          ams_mapping: amsMapping,
+          ams_mapping2: amsMapping2,
+        },
+      };
+    } else {
+      projectFileCmd = {
+        print: {
+          command: "project_file",
+          param: `Metadata/${projectMetadata.plateFileName}`,
+          url: projectUrl,
+          subtask_name: options.projectName,
+          md5,
+          flow_cali: options.flowCalibration ?? true,
+          layer_inspect: options.layerInspect ?? true,
+          vibration_cali: options.vibrationCalibration ?? true,
+          bed_leveling: options.bedLeveling ?? true,
+          bed_type: options.bedType || "textured_plate",
+          timelapse: options.timelapse ?? false,
+          use_ams: options.useAMS !== false,
+          ams_mapping: amsMapping,
+          profile_id: "0",
+          project_id: "0",
+          sequence_id: "0",
+          subtask_id: "0",
+          task_id: "0",
+        },
+      };
+    }
 
     await printer.publish(projectFileCmd);
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -288,7 +752,7 @@ export class BambuImplementation {
     const printer = await this.getPrinter(host, serial, token);
 
     try {
-      await printer.executeCommand(new UpdateStateCommand({ state: "stop" }));
+      await invokeWithoutAck(printer, new UpdateStateCommand({ state: "stop" }));
       return { status: "success", message: "Cancel command sent successfully." };
     } catch (error) {
       throw new Error(`Failed to cancel print: ${(error as Error).message}`);
@@ -327,7 +791,7 @@ export class BambuImplementation {
       );
     }
 
-    await printer.executeCommand(new GCodeLineCommand({ gcodes: [gcode] }));
+    await invokeWithoutAck(printer, new GCodeLineCommand({ gcodes: [gcode] }));
     return {
       status: "success",
       message: `Temperature command sent for ${normalizedComponent}.`,
@@ -422,7 +886,8 @@ export class BambuImplementation {
   }
 
   async startJob(host: string, serial: string, token: string, filename: string) {
-    if (filename.toLowerCase().endsWith(".3mf")) {
+    const lower = filename.toLowerCase();
+    if (lower.endsWith(".3mf") && !lower.endsWith(".gcode.3mf")) {
       throw new Error("Use print_3mf for .3mf project files.");
     }
 
@@ -433,7 +898,7 @@ export class BambuImplementation {
       ? normalizedFileName
       : `cache/${normalizedFileName}`;
 
-    await printer.executeCommand(new GCodeFileCommand({ fileName: remoteFile }));
+    await invokeWithoutAck(printer, new GCodeFileCommand({ fileName: remoteFile }));
 
     return {
       status: "success",
@@ -462,8 +927,13 @@ export class BambuImplementation {
         user: "bblp",
         password: token,
         secure: "implicit",
-        secureOptions: { rejectUnauthorized: false },
+        secureOptions: ftpsSecureOptions(),
       });
+      // With TLS 1.3 the session ticket arrives asynchronously; basic-ftp calls
+      // getSession() when opening the data channel and gets undefined if the
+      // ticket hasn't arrived yet, causing a fresh TLS negotiation that Bambu
+      // printers reject. Wait for the session ticket before proceeding.
+      await this.waitForTlsSession(client);
       // Use absolute path to avoid CWD side-effects
       const absoluteRemote = remotePath.startsWith("/") ? remotePath : `/${remotePath}`;
       const remoteDir = path.posix.dirname(absoluteRemote);
@@ -473,6 +943,19 @@ export class BambuImplementation {
     } finally {
       client.close();
     }
+  }
+
+  private async waitForTlsSession(ftpClient: FTPClient): Promise<void> {
+    const socket = (ftpClient as any).ftp?.socket;
+    if (!socket || typeof socket.getSession !== "function") return;
+    if (socket.getSession()) return;
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(resolve, 1000);
+      socket.once("session", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
   }
 
   async disconnectAll(): Promise<void> {

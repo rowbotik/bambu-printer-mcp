@@ -77,7 +77,12 @@ function parseBambuJSONConfig(jsonData) {
 }
 async function parseBambuConfig(zip) {
     // Look for common Bambu config file names
-    const potentialFiles = ['Metadata/project_settings.config', 'Metadata/model_settings.config', 'Metadata/slice_info.config'];
+    const potentialFiles = [
+        'Metadata/project_settings.config',
+        'Metadata/Slic3r_PE.config',
+        'Metadata/model_settings.config',
+        'Metadata/slice_info.config'
+    ];
     let configFile = null;
     let configContent = '';
     for (const name of potentialFiles) {
@@ -213,4 +218,119 @@ export async function parse3MF(filePath) {
         console.error(`Error parsing 3MF file ${filePath}:`, error);
         throw new Error(`Failed to parse 3MF file: ${error.message}`);
     }
+}
+export async function extractBambuTemplateSettings(filePath, outputDir) {
+    const data = await fs.readFile(filePath);
+    const zip = await JSZip.loadAsync(data);
+    const potentialFiles = [
+        'Metadata/project_settings.config',
+        'Metadata/Slic3r_PE.config',
+        'Metadata/model_settings.config',
+        'Metadata/slice_info.config'
+    ];
+    for (const name of potentialFiles) {
+        const file = zip.file(name);
+        if (!file)
+            continue;
+        const content = await file.async('string');
+        const outputPath = `${outputDir}/${name.replace(/\//g, '_')}`;
+        await fs.writeFile(outputPath, content, 'utf8');
+        return outputPath;
+    }
+    throw new Error(`No slicer settings config found in template 3MF: ${filePath}`);
+}
+const COLLAR_CHARM_ROLE_COLORS = {
+    inner: 'black',
+    outer: 'white',
+};
+const COLLAR_CHARM_ROLE_AMS_SLOTS = {
+    // User-facing convention:
+    // - inner/smaller object -> AMS 1 slot 1 black
+    // - outer/larger object -> AMS 2 slot 1 white
+    // Internal absolute tray indices are 0-based:
+    // AMS 1 slot 1 -> absolute tray 1
+    // AMS 2 slot 1 -> absolute tray 5
+    inner: 1,
+    outer: 5,
+};
+export async function analyzeCollarCharm3MF(filePath, plateIndex = 0) {
+    const data = await fs.readFile(filePath);
+    const zip = await JSZip.loadAsync(data);
+    const plateName = `Metadata/plate_${plateIndex + 1}.json`;
+    const plateFile = zip.file(plateName);
+    if (!plateFile) {
+        throw new Error(`Prepared collar charm 3MF is missing ${plateName}. Slice the project first or export a printable 3MF.`);
+    }
+    const plateJson = JSON.parse(await plateFile.async('string'));
+    const bboxObjects = Array.isArray(plateJson?.bbox_objects) ? plateJson.bbox_objects : [];
+    const usedFilamentPositions = Array.isArray(plateJson?.filament_ids)
+        ? plateJson.filament_ids.filter((value) => Number.isInteger(value)).map((value) => value)
+        : [];
+    if (bboxObjects.length !== 2) {
+        throw new Error(`Collar charm wrapper requires exactly 2 plate objects; found ${bboxObjects.length} in ${plateName}.`);
+    }
+    if (usedFilamentPositions.length !== 2) {
+        throw new Error(`Collar charm wrapper requires exactly 2 used filament positions; found ${usedFilamentPositions.length} in ${plateName}.`);
+    }
+    if (bboxObjects.length !== usedFilamentPositions.length) {
+        throw new Error(`Collar charm wrapper requires object count and used filament count to match; found ${bboxObjects.length} objects and ${usedFilamentPositions.length} filament positions in ${plateName}.`);
+    }
+    const normalizedObjects = bboxObjects.map((object, objectIndex) => {
+        const area = Number(object?.area);
+        if (!Number.isFinite(area) || area <= 0) {
+            throw new Error(`Collar charm object ${objectIndex} in ${plateName} has invalid area metadata.`);
+        }
+        const name = typeof object?.name === 'string' && object.name.trim().length > 0
+            ? object.name.trim()
+            : `object_${objectIndex + 1}`;
+        return {
+            objectIndex,
+            name,
+            area,
+            filamentPosition: usedFilamentPositions[objectIndex],
+        };
+    });
+    const sortedByArea = [...normalizedObjects].sort((a, b) => a.area - b.area);
+    if (sortedByArea[0].area === sortedByArea[1].area) {
+        throw new Error(`Collar charm wrapper could not distinguish inner vs outer object because both plate objects have the same reported area in ${plateName}.`);
+    }
+    const roles = [
+        {
+            role: 'inner',
+            objectIndex: sortedByArea[0].objectIndex,
+            name: sortedByArea[0].name,
+            area: sortedByArea[0].area,
+            filamentPosition: sortedByArea[0].filamentPosition,
+        },
+        {
+            role: 'outer',
+            objectIndex: sortedByArea[1].objectIndex,
+            name: sortedByArea[1].name,
+            area: sortedByArea[1].area,
+            filamentPosition: sortedByArea[1].filamentPosition,
+        },
+    ];
+    const trayByFilamentPosition = new Map();
+    for (const role of roles) {
+        trayByFilamentPosition.set(role.filamentPosition, COLLAR_CHARM_ROLE_AMS_SLOTS[role.role]);
+    }
+    const amsSlots = usedFilamentPositions.map((position) => {
+        const tray = trayByFilamentPosition.get(position);
+        if (tray === undefined) {
+            throw new Error(`Collar charm wrapper could not assign a tray to project filament position ${position}.`);
+        }
+        return tray;
+    });
+    return {
+        plateIndex,
+        usedFilamentPositions,
+        amsSlots,
+        roles,
+    };
+}
+export function getCollarCharmRolePolicy() {
+    return {
+        colors: COLLAR_CHARM_ROLE_COLORS,
+        amsSlots: COLLAR_CHARM_ROLE_AMS_SLOTS,
+    };
 }

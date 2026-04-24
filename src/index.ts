@@ -17,22 +17,26 @@ import path from "path";
 import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { STLManipulator, type BambuSliceOptions } from "./stl/stl-manipulator.js";
-import { parse3MF } from './3mf_parser.js';
+import { analyzeCollarCharm3MF, extractBambuTemplateSettings, getCollarCharmRolePolicy, parse3MF } from './3mf_parser.js';
 import { BambuImplementation } from "./printers/bambu.js";
 
 dotenv.config();
 
-const DEFAULT_HOST = process.env.PRINTER_HOST || "localhost";
-const DEFAULT_BAMBU_SERIAL = process.env.BAMBU_SERIAL || "";
-const DEFAULT_BAMBU_TOKEN = process.env.BAMBU_TOKEN || "";
+const DEFAULT_HOST = process.env.BAMBU_PRINTER_HOST || process.env.PRINTER_HOST || "localhost";
+const DEFAULT_BAMBU_SERIAL = process.env.BAMBU_PRINTER_SERIAL || process.env.BAMBU_SERIAL || "";
+const DEFAULT_BAMBU_TOKEN =
+  process.env.BAMBU_PRINTER_ACCESS_TOKEN || process.env.BAMBU_TOKEN || "";
 const TEMP_DIR = process.env.TEMP_DIR || path.join(process.cwd(), "temp");
 
 // Printer model and bed type
-const DEFAULT_BAMBU_MODEL = process.env.BAMBU_MODEL?.trim().toLowerCase() || "";
+const DEFAULT_BAMBU_MODEL =
+  process.env.BAMBU_PRINTER_MODEL?.trim().toLowerCase() ||
+  process.env.BAMBU_MODEL?.trim().toLowerCase() ||
+  "";
 const DEFAULT_BED_TYPE = process.env.BED_TYPE?.trim().toLowerCase() || "textured_plate";
 const DEFAULT_NOZZLE_DIAMETER = process.env.NOZZLE_DIAMETER?.trim() || "0.4";
 
-const VALID_BAMBU_MODELS = ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d"] as const;
+const VALID_BAMBU_MODELS = ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"] as const;
 type BambuModel = typeof VALID_BAMBU_MODELS[number];
 
 const VALID_BED_TYPES = ["textured_plate", "cool_plate", "engineering_plate", "hot_plate"] as const;
@@ -46,7 +50,217 @@ const BAMBU_MODEL_PRESETS: Record<string, (nozzle: string) => string> = {
   a1: (n) => `Bambu Lab A1 ${n} nozzle`,
   a1mini: (n) => `Bambu Lab A1 mini ${n} nozzle`,
   h2d: (n) => `Bambu Lab H2D ${n} nozzle`,
+  h2s: (n) => `Bambu Lab H2S ${n} nozzle`,
 };
+
+const FILAMENT_PROFILE_DIR =
+  "/Applications/BambuStudio.app/Contents/Resources/profiles/BBL/filament";
+const FILAMENT_MODEL_CODES: Record<string, string> = {
+  p1s: "P1S",
+  p1p: "P1P",
+  x1c: "X1C",
+  x1e: "X1E",
+  a1: "A1",
+  a1mini: "A1M",
+  h2d: "H2D",
+  h2s: "H2S",
+};
+
+type FilamentProfileIndex = {
+  byName: Map<string, string>;
+  baseNameByFilamentId: Map<string, string>;
+};
+
+type PrinterFilamentInventory = {
+  current_slot: number | null;
+  current_source: "ams" | "external" | null;
+  trays: Array<{
+    ams_id: number | null;
+    tray_id: number | null;
+    slot: number | null;
+    state: number;
+    loaded: boolean;
+    tray_info_idx: string | null;
+    tray_type: string | null;
+    tray_sub_brands: string | null;
+    tray_color: string | null;
+    remain_percent: number | null;
+    nozzle_temp_min: number | null;
+    nozzle_temp_max: number | null;
+    resolved_base_profile_name: string | null;
+    resolved_profile_path: string | null;
+    profile_candidates: string[];
+  }>;
+  recommended: {
+    slot: number | null;
+    tray_info_idx: string | null;
+    tray_type: string | null;
+    resolved_profile_path: string | null;
+    load_filaments: string | null;
+  } | null;
+  load_filaments_all: string | null;
+};
+
+const COLLAR_CHARM_POLICY = getCollarCharmRolePolicy();
+
+let filamentProfileIndexCache: FilamentProfileIndex | null = null;
+
+function buildFilamentProfileIndex(): FilamentProfileIndex {
+  const byName = new Map<string, string>();
+  const baseNameByFilamentId = new Map<string, string>();
+
+  if (!fs.existsSync(FILAMENT_PROFILE_DIR)) {
+    return { byName, baseNameByFilamentId };
+  }
+
+  for (const entry of fs.readdirSync(FILAMENT_PROFILE_DIR)) {
+    if (!entry.endsWith(".json")) continue;
+
+    const filePath = path.join(FILAMENT_PROFILE_DIR, entry);
+
+    try {
+      const raw = fs.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+      const name = typeof parsed?.name === "string" ? parsed.name.trim() : "";
+      const filamentId = typeof parsed?.filament_id === "string" ? parsed.filament_id.trim() : "";
+
+      if (name) {
+        byName.set(name, filePath);
+      }
+      if (name && filamentId) {
+        baseNameByFilamentId.set(filamentId, name);
+      }
+    } catch {
+      // Ignore malformed or non-profile JSON files.
+    }
+  }
+
+  return { byName, baseNameByFilamentId };
+}
+
+function getFilamentProfileIndex(): FilamentProfileIndex {
+  if (!filamentProfileIndexCache) {
+    filamentProfileIndexCache = buildFilamentProfileIndex();
+  }
+
+  return filamentProfileIndexCache;
+}
+
+function resolveFilamentProfileCandidates(
+  trayInfoIdx: string,
+  bambuModel?: string,
+  nozzleDiameter?: string
+): { baseName: string | null; paths: string[] } {
+  const index = getFilamentProfileIndex();
+  const baseName = index.baseNameByFilamentId.get(trayInfoIdx) || null;
+  if (!baseName) {
+    return { baseName: null, paths: [] };
+  }
+
+  const bareName = baseName.replace(/\s*@base$/, "");
+  const modelCode = bambuModel ? FILAMENT_MODEL_CODES[bambuModel] : undefined;
+  const candidateNames: string[] = [];
+
+  if (modelCode && nozzleDiameter) {
+    candidateNames.push(`${bareName} @BBL ${modelCode} ${nozzleDiameter} nozzle`);
+  }
+  if (modelCode) {
+    candidateNames.push(`${bareName} @BBL ${modelCode}`);
+  }
+  candidateNames.push(bareName, baseName);
+
+  const resolvedPaths = Array.from(
+    new Set(
+      candidateNames
+        .map((candidate) => index.byName.get(candidate))
+        .filter((candidate): candidate is string => Boolean(candidate))
+    )
+  );
+
+  return { baseName, paths: resolvedPaths };
+}
+
+function parseIntegerOrNull(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizePrinterFilamentInventory(
+  status: any,
+  bambuModel?: string,
+  nozzleDiameter?: string
+): PrinterFilamentInventory {
+  const rawAms = status?.raw?.ams || status?.ams || {};
+  const trayNow = parseIntegerOrNull(rawAms?.tray_now);
+  const trays: PrinterFilamentInventory["trays"] = [];
+
+  const amsArray = Array.isArray(rawAms?.ams) ? rawAms.ams : [];
+  for (const [amsIndex, amsUnit] of amsArray.entries()) {
+    const trayArray = Array.isArray(amsUnit?.tray) ? amsUnit.tray : [];
+    for (const [trayIndex, tray] of trayArray.entries()) {
+      const amsId = parseIntegerOrNull(amsUnit?.id) ?? amsIndex;
+      const trayId = parseIntegerOrNull(tray?.id) ?? trayIndex;
+      const slot = amsId !== null && trayId !== null ? amsId * 4 + trayId : null;
+      const state = parseIntegerOrNull(tray?.state) ?? 0;
+      const trayInfoIdx = typeof tray?.tray_info_idx === "string" ? tray.tray_info_idx : null;
+      const profileResolution =
+        trayInfoIdx
+          ? resolveFilamentProfileCandidates(trayInfoIdx, bambuModel, nozzleDiameter)
+          : { baseName: null, paths: [] };
+
+      trays.push({
+        ams_id: amsId,
+        tray_id: trayId,
+        slot,
+        state,
+        loaded: state !== 0 && Boolean(trayInfoIdx),
+        tray_info_idx: trayInfoIdx,
+        tray_type: typeof tray?.tray_type === "string" ? tray.tray_type : null,
+        tray_sub_brands: typeof tray?.tray_sub_brands === "string" ? tray.tray_sub_brands : null,
+        tray_color: typeof tray?.tray_color === "string" ? tray.tray_color : null,
+        remain_percent:
+          typeof tray?.remain === "number" && tray.remain >= 0 ? tray.remain : null,
+        nozzle_temp_min: parseIntegerOrNull(tray?.nozzle_temp_min),
+        nozzle_temp_max: parseIntegerOrNull(tray?.nozzle_temp_max),
+        resolved_base_profile_name: profileResolution.baseName,
+        resolved_profile_path: profileResolution.paths[0] || null,
+        profile_candidates: profileResolution.paths,
+      });
+    }
+  }
+
+  const loadedTrays = trays.filter((tray) => tray.loaded);
+  const recommendedTray =
+    loadedTrays.find((tray) => tray.slot === trayNow && tray.resolved_profile_path) ||
+    loadedTrays.find((tray) => tray.resolved_profile_path) ||
+    null;
+
+  const allProfilePaths = Array.from(
+    new Set(
+      loadedTrays
+        .flatMap((tray) => tray.profile_candidates)
+        .filter((candidate): candidate is string => Boolean(candidate))
+    )
+  );
+
+  return {
+    current_slot: trayNow !== null && trayNow >= 0 && trayNow < 254 ? trayNow : null,
+    current_source:
+      trayNow === 254 ? "external" : trayNow !== null && trayNow >= 0 && trayNow < 254 ? "ams" : null,
+    trays,
+    recommended: recommendedTray
+      ? {
+          slot: recommendedTray.slot,
+          tray_info_idx: recommendedTray.tray_info_idx,
+          tray_type: recommendedTray.tray_type,
+          resolved_profile_path: recommendedTray.resolved_profile_path,
+          load_filaments: recommendedTray.resolved_profile_path,
+        }
+      : null,
+    load_filaments_all: allProfilePaths.length > 0 ? allProfilePaths.join(";") : null,
+  };
+}
 
 function validateBambuModel(model: string): string {
   const normalized = model.trim().toLowerCase();
@@ -70,8 +284,15 @@ function resolveBedType(argsBedType: string | undefined): string {
 
 // Slicer configuration (defaults to bambustudio)
 const DEFAULT_SLICER_TYPE = process.env.SLICER_TYPE || "bambustudio";
-const DEFAULT_SLICER_PATH = process.env.SLICER_PATH || "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio";
-const DEFAULT_SLICER_PROFILE = process.env.SLICER_PROFILE || "";
+const DEFAULT_SLICER_PATH =
+  process.env.BAMBU_STUDIO_PATH ||
+  process.env.SLICER_PATH ||
+  "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio";
+const DEFAULT_SLICER_PROFILE = process.env.BAMBU_SLICER_PROFILE || process.env.SLICER_PROFILE || "";
+const DEFAULT_TEMPLATE_3MF_PATH = process.env.BAMBU_TEMPLATE_3MF_PATH || "";
+const DEFAULT_TEMPLATE_DIR =
+  process.env.BAMBU_TEMPLATE_DIR ||
+  path.join(process.env.HOME || process.cwd(), "Sync", "bambu", "templates");
 
 type RuntimeConfig = {
   transport: "stdio" | "streamable-http";
@@ -112,6 +333,26 @@ function parseCsvEnv(value: string | undefined): Set<string> {
   return new Set(value.split(",").map((e) => e.trim()).filter((e) => e.length > 0));
 }
 
+async function resolveSlicerProfilePath(
+  requestedProfile: string | undefined,
+  template3mfPath: string | undefined,
+  tempDir: string
+): Promise<string | undefined> {
+  if (requestedProfile) {
+    return requestedProfile;
+  }
+
+  if (template3mfPath) {
+    return extractBambuTemplateSettings(template3mfPath, tempDir);
+  }
+
+  return undefined;
+}
+
+function hasExplicitSlicerProfile(args: any): boolean {
+  return typeof args?.slicer_profile === "string" && args.slicer_profile.trim().length > 0;
+}
+
 function readRuntimeConfig(): RuntimeConfig {
   const rawTransport = process.env.MCP_TRANSPORT?.trim().toLowerCase();
   const transport =
@@ -138,6 +379,156 @@ type StructuredToolError = {
   message: string;
   tool: string;
 };
+
+function parseLooseSlicerConfig(content: string): Record<string, any> {
+  try {
+    return JSON.parse(content);
+  } catch {
+    const config: Record<string, any> = {};
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+      const separatorIndex = trimmed.indexOf("=");
+      if (separatorIndex === -1) continue;
+      const key = trimmed.slice(0, separatorIndex).trim();
+      const value = trimmed.slice(separatorIndex + 1).trim();
+      if (key) {
+        config[key] = value;
+      }
+    }
+    return config;
+  }
+}
+
+function summarizeSliceSettings(config: Record<string, any>) {
+  return {
+    printer_settings_id:
+      typeof config.printer_settings_id === "string" ? config.printer_settings_id : null,
+    default_print_profile:
+      typeof config.default_print_profile === "string" ? config.default_print_profile : null,
+    default_filament_profile: Array.isArray(config.default_filament_profile)
+      ? config.default_filament_profile
+      : typeof config.default_filament_profile === "string"
+        ? [config.default_filament_profile]
+        : [],
+    filament_settings_id: Array.isArray(config.filament_settings_id)
+      ? config.filament_settings_id.filter((value) => typeof value === "string" && value.length > 0)
+      : [],
+    filament_type: Array.isArray(config.filament_type)
+      ? config.filament_type.filter((value) => typeof value === "string" && value.length > 0)
+      : [],
+    inherits: typeof config.inherits === "string" ? config.inherits : null,
+    print_settings_id: typeof config.print_settings_id === "string" ? config.print_settings_id : null,
+    compatible_printers: Array.isArray(config.compatible_printers)
+      ? config.compatible_printers.filter((value) => typeof value === "string" && value.length > 0)
+      : [],
+    layer_height:
+      config.layer_height !== undefined && config.layer_height !== null
+        ? Number(config.layer_height)
+        : null,
+    first_layer_height:
+      config.initial_layer_print_height !== undefined && config.initial_layer_print_height !== null
+        ? Number(config.initial_layer_print_height)
+        : config.first_layer_height !== undefined && config.first_layer_height !== null
+          ? Number(config.first_layer_height)
+          : null,
+    sparse_infill_density:
+      config.sparse_infill_density !== undefined && config.sparse_infill_density !== null
+        ? String(config.sparse_infill_density)
+        : null,
+    wall_loops:
+      config.wall_loops !== undefined && config.wall_loops !== null
+        ? Number(config.wall_loops)
+        : null,
+    top_shell_layers:
+      config.top_shell_layers !== undefined && config.top_shell_layers !== null
+        ? Number(config.top_shell_layers)
+        : null,
+    bottom_shell_layers:
+      config.bottom_shell_layers !== undefined && config.bottom_shell_layers !== null
+        ? Number(config.bottom_shell_layers)
+        : null,
+    brim_width:
+      config.brim_width !== undefined && config.brim_width !== null
+        ? Number(config.brim_width)
+        : null,
+    support_enabled:
+      config.enable_support !== undefined
+        ? String(config.enable_support) === "1" || String(config.enable_support).toLowerCase() === "true"
+        : config.support_enabled !== undefined
+          ? Boolean(config.support_enabled)
+          : null,
+    support_type: typeof config.support_type === "string" ? config.support_type : null,
+    bed_type:
+      typeof config.curr_bed_type === "string"
+        ? config.curr_bed_type
+        : typeof config.bed_type === "string"
+          ? config.bed_type
+          : null,
+    nozzle_temperature: Array.isArray(config.nozzle_temperature)
+      ? config.nozzle_temperature
+      : config.nozzle_temperature !== undefined
+        ? [config.nozzle_temperature]
+        : [],
+  };
+}
+
+type TemplateEntry = {
+  name: string;
+  path: string;
+  source_type: "3mf" | "json" | "config";
+  relative_path: string;
+};
+
+function sanitizeTemplateName(templateName: string): string {
+  return templateName
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/\s+/g, "_")
+    .replace(/[^A-Za-z0-9/_-]/g, "_");
+}
+
+function scanTemplateRegistry(templateDir: string): TemplateEntry[] {
+  if (!fs.existsSync(templateDir)) {
+    return [];
+  }
+
+  const allowedExtensions = new Set([".3mf", ".json", ".config"]);
+  const entries: TemplateEntry[] = [];
+  const stack = [templateDir];
+
+  while (stack.length > 0) {
+    const currentDir = stack.pop()!;
+    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+
+      const extension = path.extname(entry.name).toLowerCase();
+      if (!allowedExtensions.has(extension)) {
+        continue;
+      }
+
+      const relativePath = path.relative(templateDir, fullPath);
+      const templateName = relativePath
+        .replace(/\\/g, "/")
+        .replace(/(\.gcode)?\.3mf$/i, "")
+        .replace(/\.(json|config)$/i, "");
+
+      entries.push({
+        name: templateName,
+        path: fullPath,
+        source_type: extension === ".3mf" ? "3mf" : extension === ".json" ? "json" : "config",
+        relative_path: relativePath,
+      });
+    }
+  }
+
+  return entries.sort((a, b) => a.name.localeCompare(b.name));
+}
 
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -215,6 +606,7 @@ class BambuPrinterMCPServer {
                 { const: "a1", title: "A1" },
                 { const: "a1mini", title: "A1 Mini" },
                 { const: "h2d", title: "H2D" },
+                { const: "h2s", title: "H2S" },
               ],
             },
           },
@@ -244,6 +636,215 @@ class BambuPrinterMCPServer {
       }
       throw elicitError;
     }
+  }
+
+  private async getResolvedPrinterFilamentInventory(
+    host: string,
+    bambuSerial: string,
+    bambuToken: string,
+    bambuModel?: string,
+    nozzleDiameter?: string
+  ): Promise<PrinterFilamentInventory> {
+    const status = await this.bambu.getStatus(host, bambuSerial, bambuToken);
+    return normalizePrinterFilamentInventory(status, bambuModel, nozzleDiameter);
+  }
+
+  private async inspectSliceSettings(sourcePath: string) {
+    if (!fs.existsSync(sourcePath)) {
+      throw new Error(`Slice settings source not found: ${sourcePath}`);
+    }
+
+    const extension = path.extname(sourcePath).toLowerCase();
+    const tempDir = path.join(TEMP_DIR, "slice-settings");
+    fs.mkdirSync(tempDir, { recursive: true });
+
+    if (extension === ".3mf") {
+      const parsed = await parse3MF(sourcePath);
+      const extractedSettingsPath = await extractBambuTemplateSettings(sourcePath, tempDir);
+      const config = (parsed.slicerConfig || {}) as Record<string, any>;
+      return {
+        source_path: sourcePath,
+        source_type: "3mf",
+        extracted_settings_path: extractedSettingsPath,
+        object_count: parsed.objects.length,
+        build_item_count: parsed.build.items.length,
+        metadata_keys: Object.keys(parsed.metadata),
+        summary: summarizeSliceSettings(config),
+        raw_key_count: Object.keys(config).length,
+      };
+    }
+
+    const content = fs.readFileSync(sourcePath, "utf8");
+    const config = parseLooseSlicerConfig(content);
+    return {
+      source_path: sourcePath,
+      source_type: extension === ".json" ? "json" : extension === ".config" ? "config" : "text",
+      extracted_settings_path: sourcePath,
+      summary: summarizeSliceSettings(config),
+      raw_key_count: Object.keys(config).length,
+    };
+  }
+
+  private async resolveCollarCharmPrepared3MF(
+    sourcePath: string,
+    template3mfPath: string | undefined,
+    slicerType: 'prusaslicer' | 'cura' | 'slic3r' | 'orcaslicer' | 'bambustudio',
+    slicerPath: string,
+    slicerProfile: string | undefined,
+    printModel: string,
+    printNozzle: string,
+    host: string,
+    bambuSerial: string,
+    bambuToken: string
+  ): Promise<string> {
+    if (!sourcePath.toLowerCase().endsWith(".3mf")) {
+      throw new Error("print_collar_charm requires a prepared .3mf project or sliced 3MF.");
+    }
+
+    try {
+      const JSZip = (await import('jszip')).default;
+      const zipData = fs.readFileSync(sourcePath);
+      const zip = await JSZip.loadAsync(zipData);
+      const hasGcode = Object.keys(zip.files).some(
+        (fileName) => fileName.match(/Metadata\/plate_\d+\.gcode/i) || fileName.endsWith('.gcode')
+      );
+      if (hasGcode) {
+        return sourcePath;
+      }
+    } catch (error: any) {
+      throw new Error(`Failed to inspect collar charm 3MF before slicing: ${error.message}`);
+    }
+
+    const printPreset = BAMBU_MODEL_PRESETS[printModel]?.(printNozzle);
+    const autoSliceOptions: BambuSliceOptions = {
+      uptodate: true,
+      ensureOnBed: true,
+      minSave: true,
+      skipModifiedGcodes: true,
+    };
+
+    try {
+      const liveFilaments = await this.getResolvedPrinterFilamentInventory(
+        host,
+        bambuSerial,
+        bambuToken,
+        printModel,
+        printNozzle
+      );
+      if (liveFilaments.recommended?.load_filaments) {
+        autoSliceOptions.loadFilaments = liveFilaments.recommended.load_filaments;
+      }
+    } catch (filamentError) {
+      console.warn("Could not resolve live printer filaments for collar charm auto-slicing:", filamentError);
+    }
+
+    return this.stlManipulator.sliceSTL(
+      sourcePath,
+      slicerType,
+      slicerPath,
+      slicerProfile || template3mfPath || undefined,
+      undefined,
+      printPreset,
+      autoSliceOptions
+    );
+  }
+
+  private async preflightCollarCharmPolicy(
+    host: string,
+    bambuSerial: string,
+    bambuToken: string,
+    bambuModel: string,
+    nozzleDiameter: string
+  ): Promise<PrinterFilamentInventory> {
+    const inventory = await this.getResolvedPrinterFilamentInventory(
+      host,
+      bambuSerial,
+      bambuToken,
+      bambuModel,
+      nozzleDiameter
+    );
+
+    const requiredSlots = [COLLAR_CHARM_POLICY.amsSlots.inner, COLLAR_CHARM_POLICY.amsSlots.outer];
+    for (const slot of requiredSlots) {
+      const tray = inventory.trays.find((candidate) => candidate.slot === slot);
+      if (!tray) {
+        throw new Error(`Collar charm wrapper requires AMS tray ${slot}, but that tray is not reported by the printer.`);
+      }
+      if (!tray.loaded) {
+        throw new Error(`Collar charm wrapper requires AMS tray ${slot} to be loaded, but it is currently empty or unavailable.`);
+      }
+    }
+
+    return inventory;
+  }
+
+  private listTemplateRegistry(templateDir?: string): {
+    template_dir: string;
+    templates: TemplateEntry[];
+  } {
+    const resolvedTemplateDir = templateDir && templateDir.trim().length > 0
+      ? templateDir
+      : DEFAULT_TEMPLATE_DIR;
+    return {
+      template_dir: resolvedTemplateDir,
+      templates: scanTemplateRegistry(resolvedTemplateDir),
+    };
+  }
+
+  private resolveTemplatePath(templateName?: string, templateDir?: string): string | undefined {
+    if (!templateName || templateName.trim().length === 0) {
+      return undefined;
+    }
+
+    const registry = this.listTemplateRegistry(templateDir);
+    const normalizedName = sanitizeTemplateName(templateName).toLowerCase();
+    const match = registry.templates.find((entry) => entry.name.toLowerCase() === normalizedName);
+    if (!match) {
+      throw new Error(
+        `Template "${templateName}" not found in ${registry.template_dir}.`
+      );
+    }
+
+    return match.path;
+  }
+
+  private saveTemplate(sourcePath: string, templateName?: string, templateDir?: string) {
+    if (!fs.existsSync(sourcePath)) {
+      throw new Error(`Template source not found: ${sourcePath}`);
+    }
+
+    const resolvedTemplateDir = templateDir && templateDir.trim().length > 0
+      ? templateDir
+      : DEFAULT_TEMPLATE_DIR;
+    fs.mkdirSync(resolvedTemplateDir, { recursive: true });
+
+    const sourceBaseName = path.basename(sourcePath);
+    const extension = path.extname(sourceBaseName).toLowerCase();
+    if (![".3mf", ".json", ".config"].includes(extension)) {
+      throw new Error("Templates must be .3mf, .json, or .config files.");
+    }
+
+    const baseName = templateName && templateName.trim().length > 0
+      ? sanitizeTemplateName(templateName)
+      : sanitizeTemplateName(
+          sourceBaseName
+            .replace(/(\.gcode)?\.3mf$/i, "")
+            .replace(/\.(json|config)$/i, "")
+        );
+
+    const destinationPath = path.join(resolvedTemplateDir, `${baseName}${extension}`);
+    fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+    fs.copyFileSync(sourcePath, destinationPath);
+
+    const registryEntry = this.resolveTemplatePath(baseName, resolvedTemplateDir);
+    return {
+      saved: true,
+      template_name: baseName,
+      source_path: sourcePath,
+      destination_path: destinationPath,
+      template_dir: resolvedTemplateDir,
+      resolved_path: registryEntry,
+    };
   }
 
   setupResourceHandlers() {
@@ -337,6 +938,36 @@ class BambuPrinterMCPServer {
             }
           },
           {
+            name: "get_printer_filaments",
+            description: "Get the live AMS/external filament inventory from the printer over MQTT, including resolved slicer profile paths when the printer model is known.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                host: {
+                  type: "string",
+                  description: "Hostname or IP address of the printer (default: value from env)"
+                },
+                bambu_serial: {
+                  type: "string",
+                  description: "Serial number for the Bambu Lab printer (default: value from env)"
+                },
+                bambu_token: {
+                  type: "string",
+                  description: "Access token for the Bambu Lab printer (default: value from env)"
+                },
+                bambu_model: {
+                  type: "string",
+                  enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
+                  description: "Optional model hint used to resolve Bambu/Orca filament profile JSONs for each tray."
+                },
+                nozzle_diameter: {
+                  type: "string",
+                  description: "Optional nozzle diameter used when resolving model-specific filament profile JSONs (default: 0.4)."
+                }
+              }
+            }
+          },
+          {
             name: "extend_stl_base",
             description: "Extend the base of an STL file by a specified amount",
             inputSchema: {
@@ -388,6 +1019,107 @@ class BambuPrinterMCPServer {
             }
           },
           {
+            name: "list_templates",
+            description: "List saved slicing templates from the local template registry directory.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                template_dir: {
+                  type: "string",
+                  description: "Optional template directory override. Defaults to BAMBU_TEMPLATE_DIR or ~/Sync/bambu/templates."
+                }
+              }
+            }
+          },
+          {
+            name: "save_template",
+            description: "Copy a 3MF, JSON, or config file into the local template registry and register it under a template name.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                source_path: {
+                  type: "string",
+                  description: "Path to a local .3mf, .json, or .config file to save into the template registry."
+                },
+                template_name: {
+                  type: "string",
+                  description: "Optional template name. Defaults to the source filename without extension."
+                },
+                template_dir: {
+                  type: "string",
+                  description: "Optional template directory override. Defaults to BAMBU_TEMPLATE_DIR or ~/Sync/bambu/templates."
+                }
+              },
+              required: ["source_path"]
+            }
+          },
+          {
+            name: "get_slice_settings",
+            description: "Inspect slicer settings from a saved 3MF template or a JSON/config slicer profile without slicing anything.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                source_path: {
+                  type: "string",
+                  description: "Path to a 3MF template, extracted project_settings.config, or slicer profile JSON."
+                },
+                template_name: {
+                  type: "string",
+                  description: "Optional named template from the local registry. If provided, resolves source_path automatically."
+                },
+                template_dir: {
+                  type: "string",
+                  description: "Optional template directory override when resolving template_name."
+                }
+              },
+              anyOf: [
+                { required: ["source_path"] },
+                { required: ["template_name"] }
+              ]
+            }
+          },
+          {
+            name: "slice_with_template",
+            description: "Slice an STL or 3MF using a named template from the local registry. This is a higher-level wrapper around slice_stl for template-based workflows.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                stl_path: { type: "string", description: "Path to the STL or 3MF file to slice" },
+                template_name: { type: "string", description: "Named template from the local registry." },
+                template_dir: { type: "string", description: "Optional template directory override when resolving template_name." },
+                bambu_model: {
+                  type: "string",
+                  enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
+                  description: "REQUIRED: Bambu Lab printer model. Ask the user if not known. Using the wrong model can damage the printer."
+                },
+                slicer_type: {
+                  type: "string",
+                  description: "Type of slicer to use (bambustudio, prusaslicer, cura, slic3r, orcaslicer) (default: bambustudio)"
+                },
+                slicer_path: { type: "string", description: "Path to the slicer executable (default: value from env)" },
+                nozzle_diameter: { type: "string", description: "Nozzle diameter in mm (default: 0.4)" },
+                use_printer_filaments: { type: "boolean", description: "When true, and no explicit slicer profile or load_filaments override is provided, use the printer's current or first loaded AMS filament as the slicer filament profile." },
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" },
+                load_filaments: { type: "string", description: "Override filament profiles. Semicolon-separated paths to filament JSON configs." },
+                load_filament_ids: { type: "string", description: "Optional filament-to-object mapping string." },
+                ensure_on_bed: { type: "boolean", description: "Lift floating models onto the bed." },
+                arrange: { type: "boolean", description: "Auto-arrange objects on the build plate." },
+                orient: { type: "boolean", description: "Auto-orient model for optimal printability." },
+                repetitions: { type: "number", description: "Number of copies to print." },
+                scale: { type: "number", description: "Uniform scale factor." },
+                rotate: { type: "number", description: "Z-axis rotation in degrees." },
+                rotate_x: { type: "number", description: "X-axis rotation in degrees." },
+                rotate_y: { type: "number", description: "Y-axis rotation in degrees." },
+                min_save: { type: "boolean", description: "Produce smaller output 3MF." },
+                skip_modified_gcodes: { type: "boolean", description: "Ignore stale custom gcodes in the 3MF." },
+                slice_plate: { type: "number", description: "Which plate index to slice. 0 = all plates." }
+              },
+              required: ["stl_path", "template_name", "bambu_model"]
+            }
+          },
+          {
             name: "slice_stl",
             description: "Slice an STL or 3MF file using a slicer to generate printable G-code or sliced 3MF. IMPORTANT: bambu_model must be specified to ensure the slicer generates safe G-code for the correct printer.",
             inputSchema: {
@@ -396,7 +1128,7 @@ class BambuPrinterMCPServer {
                 stl_path: { type: "string", description: "Path to the STL or 3MF file to slice" },
                 bambu_model: {
                   type: "string",
-                  enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d"],
+                  enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
                   description: "REQUIRED: Bambu Lab printer model. Ask the user if not known. Using the wrong model can damage the printer."
                 },
                 slicer_type: {
@@ -405,7 +1137,11 @@ class BambuPrinterMCPServer {
                 },
                 slicer_path: { type: "string", description: "Path to the slicer executable (default: value from env)" },
                 slicer_profile: { type: "string", description: "Path to the slicer profile/config file (optional, overrides bambu_model preset)" },
+                template_3mf_path: { type: "string", description: "Optional template 3MF whose embedded Bambu slicer settings should be reused when slicing a new STL or 3MF." },
+                template_name: { type: "string", description: "Optional named template from the local registry. Resolves to template_3mf_path automatically." },
+                template_dir: { type: "string", description: "Optional template directory override when resolving template_name." },
                 nozzle_diameter: { type: "string", description: "Nozzle diameter in mm (default: 0.4)" },
+                use_printer_filaments: { type: "boolean", description: "When true, and no explicit slicer profile or load_filaments override is provided, use the printer's current or first loaded AMS filament as the slicer filament profile. Template 3MF process settings can still be used at the same time." },
                 uptodate: { type: "boolean", description: "Refresh 3MF preset configs to match the latest BambuStudio version. Use when slicing downloaded or older 3MF files to prevent stale-config failures." },
                 repetitions: { type: "number", description: "Print N identical copies of the model. Each copy gets its own plate placement. Example: 3 prints three copies." },
                 orient: { type: "boolean", description: "Auto-orient the model for optimal printability (minimize supports, maximize bed adhesion). Recommended for raw STL imports that lack a pre-set orientation." },
@@ -521,7 +1257,7 @@ class BambuPrinterMCPServer {
                 three_mf_path: { type: "string", description: "Path to the 3MF file to print" },
                 bambu_model: {
                   type: "string",
-                  enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d"],
+                  enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
                   description: "REQUIRED: Bambu Lab printer model. Ask the user if not known. Using the wrong model can damage the printer."
                 },
                 bed_type: {
@@ -535,16 +1271,60 @@ class BambuPrinterMCPServer {
                 use_ams: { type: "boolean", description: "Whether to use the AMS (default: auto-detect from 3MF)" },
                 ams_mapping: {
                   type: "array",
-                  description: "AMS slot mapping array, e.g. [0, 2] maps filaments to AMS slots 0 and 2",
+                  description: "Project-level AMS mapping array. Position = project filament index, value = absolute AMS tray (0-3=AMS 0, 4-7=AMS 1, 8-11=AMS 2, 128+=AMS-HT, 254=external, -1=unused). Prefer ams_slots unless you know the project-level layout.",
                   items: { type: "number" }
+                },
+                ams_slots: {
+                  type: "array",
+                  description: "Preferred AMS input: one absolute tray index per USED filament in plate order, e.g. [1] for a single-filament print pulling from AMS 0 slot 1. Expanded to project-level ams_mapping automatically from the 3MF's plate_N.json and gcode header.",
+                  items: { type: "number" }
+                },
+                bed_leveling: { type: "boolean", description: "Enable auto bed leveling (default: true)" },
+                                flow_calibration: { type: "boolean", description: "Enable flow calibration (default: true)" },
+                                vibration_calibration: { type: "boolean", description: "Enable vibration calibration (default: true)" },
+                                timelapse: { type: "boolean", description: "Enable timelapse recording (default: false)" },
+                                slicer_profile: { type: "string", description: "Path to the slicer profile/config file for auto-slicing (optional)." },
+                                template_3mf_path: { type: "string", description: "Optional template 3MF whose embedded Bambu slicer settings should be reused when auto-slicing this print job." },
+                                template_name: { type: "string", description: "Optional named template from the local registry. Resolves to template_3mf_path automatically." },
+                                template_dir: { type: "string", description: "Optional template directory override when resolving template_name." },
+                                nozzle_diameter: { type: "string", description: "Nozzle diameter in mm for auto-slicing (default: 0.4)" }
+                              },
+              required: ["three_mf_path", "bambu_model"]
+            }
+          },
+          {
+            name: "print_collar_charm",
+            description: "Print a prepared two-part dog collar charm project on Kingpin/H2 using the fixed tray policy: inner/smaller object -> black on AMS 1 slot 1, outer/larger object -> white on AMS 2 slot 1.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                source_path: { type: "string", description: "Path to a prepared collar charm .3mf project or sliced 3MF." },
+                template_name: { type: "string", description: "Named collar charm template from the local registry. Resolves source_path automatically." },
+                template_dir: { type: "string", description: "Optional template directory override when resolving template_name." },
+                bambu_model: {
+                  type: "string",
+                  enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
+                  description: "REQUIRED: Bambu Lab printer model. For this wrapper, H2D on Kingpin is the intended path."
+                },
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" },
+                bed_type: {
+                  type: "string",
+                  enum: ["textured_plate", "cool_plate", "engineering_plate", "hot_plate"],
+                  description: "Bed plate type currently installed (default: textured_plate)"
                 },
                 bed_leveling: { type: "boolean", description: "Enable auto bed leveling (default: true)" },
                 flow_calibration: { type: "boolean", description: "Enable flow calibration (default: true)" },
                 vibration_calibration: { type: "boolean", description: "Enable vibration calibration (default: true)" },
                 timelapse: { type: "boolean", description: "Enable timelapse recording (default: false)" },
+                slicer_profile: { type: "string", description: "Path to the slicer profile/config file for auto-slicing (optional)." },
                 nozzle_diameter: { type: "string", description: "Nozzle diameter in mm for auto-slicing (default: 0.4)" }
               },
-              required: ["three_mf_path", "bambu_model"]
+              anyOf: [
+                { required: ["source_path", "bambu_model"] },
+                { required: ["template_name", "bambu_model"] }
+              ]
             }
           },
           {
@@ -612,6 +1392,17 @@ class BambuPrinterMCPServer {
       const slicerType = String(args?.slicer_type || DEFAULT_SLICER_TYPE) as 'prusaslicer' | 'cura' | 'slic3r' | 'orcaslicer' | 'bambustudio';
       const slicerPath = String(args?.slicer_path || DEFAULT_SLICER_PATH);
       const slicerProfile = String(args?.slicer_profile || DEFAULT_SLICER_PROFILE);
+      const requestedTemplateDir =
+        typeof args?.template_dir === "string" && args.template_dir.trim().length > 0
+          ? String(args.template_dir)
+          : undefined;
+      const resolvedTemplatePathFromName = this.resolveTemplatePath(
+        typeof args?.template_name === "string" ? String(args.template_name) : undefined,
+        requestedTemplateDir
+      );
+      const template3mfPath = String(
+        resolvedTemplatePathFromName || args?.template_3mf_path || DEFAULT_TEMPLATE_3MF_PATH
+      );
 
       try {
         let result;
@@ -619,6 +1410,35 @@ class BambuPrinterMCPServer {
         switch (name) {
           case "get_printer_status":
             result = await this.bambu.getStatus(host, bambuSerial, bambuToken);
+            break;
+
+          case "get_printer_filaments": {
+            const requestedModel = (String(args?.bambu_model ?? DEFAULT_BAMBU_MODEL ?? "")).trim().toLowerCase();
+            const normalizedModel = requestedModel ? validateBambuModel(requestedModel) : undefined;
+            const nozzleDiam = String(args?.nozzle_diameter || DEFAULT_NOZZLE_DIAMETER);
+            result = await this.getResolvedPrinterFilamentInventory(
+              host,
+              bambuSerial,
+              bambuToken,
+              normalizedModel,
+              nozzleDiam
+            );
+            break;
+          }
+
+          case "list_templates":
+            result = this.listTemplateRegistry(requestedTemplateDir);
+            break;
+
+          case "save_template":
+            if (!args?.source_path) {
+              throw new Error("Missing required parameter: source_path");
+            }
+            result = this.saveTemplate(
+              String(args.source_path),
+              typeof args?.template_name === "string" ? String(args.template_name) : undefined,
+              requestedTemplateDir
+            );
             break;
 
           case "list_printer_files":
@@ -713,12 +1533,98 @@ class BambuPrinterMCPServer {
             result = await this.stlManipulator.getSTLInfo(String(args.stl_path));
             break;
 
+          case "get_slice_settings":
+            if (!args?.source_path && !args?.template_name) {
+              throw new Error("Missing required parameter: source_path or template_name");
+            }
+            result = await this.inspectSliceSettings(
+              String(resolvedTemplatePathFromName || args.source_path)
+            );
+            break;
+
+          case "slice_with_template": {
+            if (!args?.stl_path) {
+              throw new Error("Missing required parameter: stl_path");
+            }
+            if (!args?.template_name) {
+              throw new Error("Missing required parameter: template_name");
+            }
+            const sliceModel = await this.resolveBambuModel(args?.bambu_model as string | undefined);
+            const nozzleDiam = String(args?.nozzle_diameter || DEFAULT_NOZZLE_DIAMETER);
+            const activeSlicerProfile = await resolveSlicerProfilePath(
+              slicerProfile || undefined,
+              resolvedTemplatePathFromName || template3mfPath || undefined,
+              TEMP_DIR
+            );
+            const explicitSlicerProfile = hasExplicitSlicerProfile(args);
+            const printerPreset = BAMBU_MODEL_PRESETS[sliceModel]?.(nozzleDiam);
+
+            const sliceBambuOptions: BambuSliceOptions = {};
+            if (args?.uptodate !== undefined) sliceBambuOptions.uptodate = Boolean(args.uptodate);
+            if (args?.repetitions !== undefined) sliceBambuOptions.repetitions = Number(args.repetitions);
+            if (args?.orient !== undefined) sliceBambuOptions.orient = Boolean(args.orient);
+            if (args?.arrange !== undefined) sliceBambuOptions.arrange = Boolean(args.arrange);
+            if (args?.ensure_on_bed !== undefined) sliceBambuOptions.ensureOnBed = Boolean(args.ensure_on_bed);
+            if (args?.clone_objects !== undefined) sliceBambuOptions.cloneObjects = String(args.clone_objects);
+            if (args?.skip_objects !== undefined) sliceBambuOptions.skipObjects = String(args.skip_objects);
+            if (args?.load_filaments !== undefined) sliceBambuOptions.loadFilaments = String(args.load_filaments);
+            if (args?.load_filament_ids !== undefined) sliceBambuOptions.loadFilamentIds = String(args.load_filament_ids);
+            if (args?.enable_timelapse !== undefined) sliceBambuOptions.enableTimelapse = Boolean(args.enable_timelapse);
+            if (args?.allow_mix_temp !== undefined) sliceBambuOptions.allowMixTemp = Boolean(args.allow_mix_temp);
+            if (args?.scale !== undefined) sliceBambuOptions.scale = Number(args.scale);
+            if (args?.rotate !== undefined) sliceBambuOptions.rotate = Number(args.rotate);
+            if (args?.rotate_x !== undefined) sliceBambuOptions.rotateX = Number(args.rotate_x);
+            if (args?.rotate_y !== undefined) sliceBambuOptions.rotateY = Number(args.rotate_y);
+            if (args?.min_save !== undefined) sliceBambuOptions.minSave = Boolean(args.min_save);
+            if (args?.skip_modified_gcodes !== undefined) sliceBambuOptions.skipModifiedGcodes = Boolean(args.skip_modified_gcodes);
+            if (args?.slice_plate !== undefined) sliceBambuOptions.slicePlate = Number(args.slice_plate);
+            const usePrinterFilaments =
+              args?.use_printer_filaments !== undefined ? Boolean(args.use_printer_filaments) : true;
+            if (
+              usePrinterFilaments &&
+              !explicitSlicerProfile &&
+              !sliceBambuOptions.loadFilaments &&
+              bambuSerial &&
+              bambuToken
+            ) {
+              try {
+                const liveFilaments = await this.getResolvedPrinterFilamentInventory(
+                  host,
+                  bambuSerial,
+                  bambuToken,
+                  sliceModel,
+                  nozzleDiam
+                );
+                if (liveFilaments.recommended?.load_filaments) {
+                  sliceBambuOptions.loadFilaments = liveFilaments.recommended.load_filaments;
+                }
+              } catch (filamentError) {
+                console.warn("Could not resolve live printer filaments for slicing:", filamentError);
+              }
+            }
+
+            result = await this.stlManipulator.sliceSTL(
+              String(args.stl_path), slicerType, slicerPath,
+              activeSlicerProfile,
+              undefined,
+              printerPreset,
+              sliceBambuOptions
+            );
+            break;
+          }
+
           case "slice_stl": {
             if (!args?.stl_path) {
               throw new Error("Missing required parameter: stl_path");
             }
             const sliceModel = await this.resolveBambuModel(args?.bambu_model as string | undefined);
             const nozzleDiam = String(args?.nozzle_diameter || DEFAULT_NOZZLE_DIAMETER);
+            const activeSlicerProfile = await resolveSlicerProfilePath(
+              slicerProfile || undefined,
+              template3mfPath || undefined,
+              TEMP_DIR
+            );
+            const explicitSlicerProfile = hasExplicitSlicerProfile(args);
             // Resolve printer preset for BambuStudio slicer
             const printerPreset = BAMBU_MODEL_PRESETS[sliceModel]?.(nozzleDiam);
 
@@ -741,10 +1647,34 @@ class BambuPrinterMCPServer {
             if (args?.min_save !== undefined) sliceBambuOptions.minSave = Boolean(args.min_save);
             if (args?.skip_modified_gcodes !== undefined) sliceBambuOptions.skipModifiedGcodes = Boolean(args.skip_modified_gcodes);
             if (args?.slice_plate !== undefined) sliceBambuOptions.slicePlate = Number(args.slice_plate);
+            const usePrinterFilaments =
+              args?.use_printer_filaments !== undefined ? Boolean(args.use_printer_filaments) : true;
+            if (
+              usePrinterFilaments &&
+              !explicitSlicerProfile &&
+              !sliceBambuOptions.loadFilaments &&
+              bambuSerial &&
+              bambuToken
+            ) {
+              try {
+                const liveFilaments = await this.getResolvedPrinterFilamentInventory(
+                  host,
+                  bambuSerial,
+                  bambuToken,
+                  sliceModel,
+                  nozzleDiam
+                );
+                if (liveFilaments.recommended?.load_filaments) {
+                  sliceBambuOptions.loadFilaments = liveFilaments.recommended.load_filaments;
+                }
+              } catch (filamentError) {
+                console.warn("Could not resolve live printer filaments for slicing:", filamentError);
+              }
+            }
 
             result = await this.stlManipulator.sliceSTL(
               String(args.stl_path), slicerType, slicerPath,
-              slicerProfile || undefined,
+              activeSlicerProfile,
               undefined, // progressCallback
               printerPreset,
               sliceBambuOptions
@@ -763,6 +1693,12 @@ class BambuPrinterMCPServer {
             const printModel = await this.resolveBambuModel(args?.bambu_model as string | undefined);
             const printBedType = resolveBedType(args?.bed_type as string | undefined);
             const printNozzle = String(args?.nozzle_diameter || DEFAULT_NOZZLE_DIAMETER);
+            const activeSlicerProfile = await resolveSlicerProfilePath(
+              slicerProfile || undefined,
+              template3mfPath || undefined,
+              TEMP_DIR
+            );
+            const explicitSlicerProfile = hasExplicitSlicerProfile(args);
             const printPreset = BAMBU_MODEL_PRESETS[printModel]?.(printNozzle);
 
             let threeMFPath = String(args.three_mf_path);
@@ -783,8 +1719,24 @@ class BambuPrinterMCPServer {
                   minSave: true,
                   skipModifiedGcodes: true,
                 };
+                if (!explicitSlicerProfile) {
+                  try {
+                    const liveFilaments = await this.getResolvedPrinterFilamentInventory(
+                      host,
+                      bambuSerial,
+                      bambuToken,
+                      printModel,
+                      printNozzle
+                    );
+                    if (liveFilaments.recommended?.load_filaments) {
+                      autoSliceOptions.loadFilaments = liveFilaments.recommended.load_filaments;
+                    }
+                  } catch (filamentError) {
+                    console.warn("Could not resolve live printer filaments for auto-slicing:", filamentError);
+                  }
+                }
                 threeMFPath = await this.stlManipulator.sliceSTL(
-                  threeMFPath, slicerType, slicerPath, slicerProfile || undefined,
+                  threeMFPath, slicerType, slicerPath, activeSlicerProfile,
                   undefined, // progressCallback
                   printPreset,
                   autoSliceOptions
@@ -848,6 +1800,88 @@ class BambuPrinterMCPServer {
               timelapse: args?.timelapse !== undefined ? Boolean(args.timelapse) : undefined,
             });
             result = `Print command for ${threeMfFilename} sent successfully.`;
+            break;
+          }
+
+          case "print_collar_charm": {
+            const resolvedSourcePath = String(resolvedTemplatePathFromName || args?.source_path || "");
+            if (!resolvedSourcePath) {
+              throw new Error("Missing required parameter: source_path or template_name");
+            }
+            if (!bambuSerial || !bambuToken) {
+              throw new Error("Bambu serial number and access token are required for print_collar_charm.");
+            }
+
+            const printModel = await this.resolveBambuModel(args?.bambu_model as string | undefined);
+            const printBedType = resolveBedType(args?.bed_type as string | undefined);
+            const printNozzle = String(args?.nozzle_diameter || DEFAULT_NOZZLE_DIAMETER);
+            const activeSlicerProfile = await resolveSlicerProfilePath(
+              slicerProfile || undefined,
+              resolvedTemplatePathFromName || template3mfPath || undefined,
+              TEMP_DIR
+            );
+
+            const preparedThreeMFPath = await this.resolveCollarCharmPrepared3MF(
+              resolvedSourcePath,
+              resolvedTemplatePathFromName || template3mfPath || undefined,
+              slicerType,
+              slicerPath,
+              activeSlicerProfile || undefined,
+              printModel,
+              printNozzle,
+              host,
+              bambuSerial,
+              bambuToken
+            );
+
+            const collarAnalysis = await analyzeCollarCharm3MF(preparedThreeMFPath, 0);
+            const inventory = await this.preflightCollarCharmPolicy(
+              host,
+              bambuSerial,
+              bambuToken,
+              printModel,
+              printNozzle
+            );
+
+            const projectName = path.basename(preparedThreeMFPath).replace(/\.3mf$/i, '');
+            result = await this.bambu.print3mf(host, bambuSerial, bambuToken, {
+              projectName,
+              filePath: preparedThreeMFPath,
+              plateIndex: collarAnalysis.plateIndex,
+              useAMS: true,
+              amsSlots: collarAnalysis.amsSlots,
+              bedType: printBedType,
+              bedLeveling: args?.bed_leveling !== undefined ? Boolean(args.bed_leveling) : true,
+              flowCalibration: args?.flow_calibration !== undefined ? Boolean(args.flow_calibration) : true,
+              vibrationCalibration: args?.vibration_calibration !== undefined ? Boolean(args.vibration_calibration) : true,
+              timelapse: args?.timelapse !== undefined ? Boolean(args.timelapse) : false,
+            });
+
+            result = {
+              ...result,
+              source_path: resolvedSourcePath,
+              prepared_three_mf_path: preparedThreeMFPath,
+              tray_policy: {
+                inner: {
+                  color: COLLAR_CHARM_POLICY.colors.inner,
+                  absolute_tray: COLLAR_CHARM_POLICY.amsSlots.inner,
+                },
+                outer: {
+                  color: COLLAR_CHARM_POLICY.colors.outer,
+                  absolute_tray: COLLAR_CHARM_POLICY.amsSlots.outer,
+                },
+              },
+              collar_roles: collarAnalysis.roles,
+              inventory_slots_checked: inventory.trays
+                .filter((tray) => tray.slot === COLLAR_CHARM_POLICY.amsSlots.inner || tray.slot === COLLAR_CHARM_POLICY.amsSlots.outer)
+                .map((tray) => ({
+                  slot: tray.slot,
+                  loaded: tray.loaded,
+                  tray_color: tray.tray_color,
+                  tray_type: tray.tray_type,
+                  tray_info_idx: tray.tray_info_idx,
+                })),
+            };
             break;
           }
 

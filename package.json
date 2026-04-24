@@ -42,12 +42,14 @@
     "basic-ftp": "^5.0.5",
     "dotenv": "^16.3.1",
     "jszip": "^3.10.1",
+    "mqtt": "^5.15.1",
     "three": "^0.173.0",
     "xml2js": "^0.6.2"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",
     "@types/three": "^0.173.0",
-    "@types/xml2js": "^0.4.14"
+    "@types/xml2js": "^0.4.14",
+    "typescript": "^6.0.3"
   }
 }

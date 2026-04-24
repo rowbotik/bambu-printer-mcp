@@ -56,3 +56,18 @@ export interface ThreeMFData {
     build: { items: ThreeMFBuildItem[] };
     slicerConfig?: Partial<BambuSlicerConfig>;
 }
+
+export interface CollarCharmRole {
+    role: 'inner' | 'outer';
+    objectIndex: number;
+    name: string;
+    area: number;
+    filamentPosition: number;
+}
+
+export interface CollarCharmAnalysis {
+    plateIndex: number;
+    usedFilamentPositions: number[];
+    amsSlots: number[];
+    roles: CollarCharmRole[];
+}

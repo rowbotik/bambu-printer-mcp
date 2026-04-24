@@ -10,6 +10,10 @@ import * as crypto from 'crypto';
 import { execFile } from 'child_process';
 const readFileAsync = promisify(fs.readFile);
 const writeFileAsync = promisify(fs.writeFile);
+const BAMBU_PROFILE_ROOTS = [
+    '/Applications/BambuStudio.app/Contents/Resources/profiles/BBL',
+    '/Applications/OrcaSlicer.app/Contents/Resources/profiles/BBL',
+];
 export class STLManipulator extends EventEmitter {
     constructor(tempDir = path.join(process.cwd(), 'temp')) {
         super();
@@ -25,6 +29,187 @@ export class STLManipulator extends EventEmitter {
      */
     generateOperationId() {
         return crypto.randomUUID();
+    }
+    getAvailableProfileRoots() {
+        return BAMBU_PROFILE_ROOTS.filter((root) => fs.existsSync(root));
+    }
+    findProfileFile(category, profileName) {
+        if (!profileName) {
+            return undefined;
+        }
+        for (const root of this.getAvailableProfileRoots()) {
+            const candidate = path.join(root, category, `${profileName}.json`);
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+        return undefined;
+    }
+    buildFilamentIdIndex() {
+        const index = new Map();
+        for (const root of this.getAvailableProfileRoots()) {
+            const filamentDir = path.join(root, 'filament');
+            if (!fs.existsSync(filamentDir)) {
+                continue;
+            }
+            for (const entry of fs.readdirSync(filamentDir)) {
+                if (!entry.endsWith('.json')) {
+                    continue;
+                }
+                const filePath = path.join(filamentDir, entry);
+                try {
+                    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                    const filamentId = typeof parsed?.filament_id === 'string' ? parsed.filament_id.trim() : '';
+                    if (filamentId && !index.has(filamentId)) {
+                        index.set(filamentId, filePath);
+                    }
+                }
+                catch {
+                    // Ignore malformed JSON.
+                }
+            }
+        }
+        return index;
+    }
+    readJsonFile(filePath) {
+        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    }
+    stripAbsoluteExtruderResets(value) {
+        if (typeof value === 'string') {
+            return value
+                .split(/\r?\n/)
+                .filter((line) => line.trim().toUpperCase() !== 'G92 E0')
+                .join('\n');
+        }
+        if (Array.isArray(value)) {
+            return value.filter((line) => String(line).trim().toUpperCase() !== 'G92 E0');
+        }
+        return value;
+    }
+    sanitizeProcessForOrca(processConfig, printerPreset) {
+        const sanitized = { ...processConfig };
+        sanitized.type = 'process';
+        if (!sanitized.from || sanitized.from === 'project') {
+            sanitized.from = 'User';
+        }
+        if (printerPreset) {
+            sanitized.compatible_printers = [printerPreset];
+        }
+        if (sanitized.prime_tower_brim_width !== undefined &&
+            Number(sanitized.prime_tower_brim_width) < 0) {
+            sanitized.prime_tower_brim_width = '0';
+        }
+        else if (sanitized.prime_tower_brim_width !== undefined) {
+            sanitized.prime_tower_brim_width = String(sanitized.prime_tower_brim_width);
+        }
+        sanitized.use_relative_e_distances = '0';
+        sanitized.before_layer_change_gcode = this.stripAbsoluteExtruderResets(sanitized.before_layer_change_gcode);
+        sanitized.layer_gcode = this.stripAbsoluteExtruderResets(sanitized.layer_gcode);
+        sanitized.layer_change_gcode = this.stripAbsoluteExtruderResets(sanitized.layer_change_gcode);
+        return sanitized;
+    }
+    writeTempJson(outputBase, suffix, value) {
+        const outPath = path.join(this.tempDir, `${outputBase}_${suffix}.json`);
+        fs.writeFileSync(outPath, JSON.stringify(value, null, 2));
+        return outPath;
+    }
+    resolveBambuLikeSettingsBundle(outputBase, slicerType, slicerProfile, printerPreset, bambuOptions) {
+        const machinePath = this.findProfileFile('machine', printerPreset);
+        const machineConfig = machinePath ? this.readJsonFile(machinePath) : null;
+        const hasSlicerProfile = !!slicerProfile && fs.existsSync(slicerProfile);
+        const filamentPaths = [];
+        let processPath;
+        let parsedProfile = null;
+        if (hasSlicerProfile) {
+            try {
+                parsedProfile = this.readJsonFile(slicerProfile);
+            }
+            catch {
+                parsedProfile = null;
+            }
+        }
+        if (parsedProfile && typeof parsedProfile === 'object') {
+            const inheritedProcessName = (typeof parsedProfile.inherits === 'string' && parsedProfile.inherits) ||
+                (typeof parsedProfile.print_settings_id === 'string' &&
+                    parsedProfile.print_settings_id !== parsedProfile.name
+                    ? parsedProfile.print_settings_id
+                    : undefined) ||
+                (typeof parsedProfile.default_print_profile === 'string'
+                    ? parsedProfile.default_print_profile
+                    : undefined) ||
+                (typeof machineConfig?.default_print_profile === 'string'
+                    ? machineConfig.default_print_profile
+                    : undefined);
+            const inheritedProcessPath = this.findProfileFile('process', inheritedProcessName);
+            const inheritedProcess = inheritedProcessPath && fs.existsSync(inheritedProcessPath)
+                ? this.readJsonFile(inheritedProcessPath)
+                : {};
+            const mergedProcess = {
+                ...inheritedProcess,
+                ...parsedProfile,
+                type: 'process',
+            };
+            processPath = this.writeTempJson(outputBase, slicerType === 'orcaslicer' ? 'process_orca' : 'process', slicerType === 'orcaslicer'
+                ? this.sanitizeProcessForOrca(mergedProcess, printerPreset)
+                : mergedProcess);
+            const defaultFilamentProfiles = Array.isArray(parsedProfile.default_filament_profile)
+                ? parsedProfile.default_filament_profile
+                : [];
+            for (const profileName of defaultFilamentProfiles) {
+                const filamentPath = this.findProfileFile('filament', String(profileName));
+                if (filamentPath) {
+                    filamentPaths.push(filamentPath);
+                }
+            }
+            if (filamentPaths.length === 0 && Array.isArray(parsedProfile.filament_ids)) {
+                const filamentIdIndex = this.buildFilamentIdIndex();
+                for (const filamentId of parsedProfile.filament_ids) {
+                    const filamentPath = filamentIdIndex.get(String(filamentId));
+                    if (filamentPath) {
+                        filamentPaths.push(filamentPath);
+                    }
+                }
+            }
+        }
+        else if (hasSlicerProfile) {
+            processPath = slicerProfile;
+        }
+        if (!processPath) {
+            const defaultProcessName = typeof machineConfig?.default_print_profile === 'string'
+                ? machineConfig.default_print_profile
+                : undefined;
+            const defaultProcessPath = this.findProfileFile('process', defaultProcessName);
+            if (defaultProcessPath) {
+                processPath =
+                    slicerType === 'orcaslicer'
+                        ? this.writeTempJson(outputBase, 'process_default_orca', this.sanitizeProcessForOrca(this.readJsonFile(defaultProcessPath), printerPreset))
+                        : defaultProcessPath;
+            }
+        }
+        if (!bambuOptions?.loadFilaments &&
+            filamentPaths.length === 0 &&
+            Array.isArray(machineConfig?.default_filament_profile)) {
+            for (const profileName of machineConfig.default_filament_profile) {
+                const filamentPath = this.findProfileFile('filament', String(profileName));
+                if (filamentPath) {
+                    filamentPaths.push(filamentPath);
+                }
+            }
+        }
+        if (bambuOptions?.loadFilaments) {
+            filamentPaths.length = 0;
+            for (const filamentPath of bambuOptions.loadFilaments.split(';')) {
+                const trimmed = filamentPath.trim();
+                if (trimmed) {
+                    filamentPaths.push(trimmed);
+                }
+            }
+        }
+        const settingsParts = [machinePath, processPath].filter((entry) => Boolean(entry));
+        return {
+            settingsArg: settingsParts.length > 0 ? settingsParts.join(';') : undefined,
+            filamentPaths: Array.from(new Set(filamentPaths)),
+        };
     }
     /**
      * Load STL file and return geometry and bounding box
@@ -769,24 +954,6 @@ export class STLManipulator extends EventEmitter {
                     // Remove empty profile arg if not provided
                     args = args.filter(arg => arg !== '');
                     break;
-                case 'orcaslicer': // Add OrcaSlicer case
-                    args = [
-                        // OrcaSlicer might use --load-settings like Bambu, or --load like Prusa
-                        // Assuming --load-settings based on discussion, adjust if needed.
-                        // Also assuming profile path points to the main .ini or .json config.
-                        '--load-settings', slicerProfile || '',
-                        '--output', outputFilePath, // Assuming --output works like PrusaSlicer
-                        stlFilePath
-                    ];
-                    // Alternative if --output doesn't specify filename:
-                    // args = [
-                    //    '--load-settings', slicerProfile || '',
-                    //    '--outputdir', this.tempDir,
-                    //    stlFilePath
-                    // ];
-                    // Remove empty profile arg if not provided
-                    args = args.filter(arg => arg !== '');
-                    break;
                 case 'cura':
                     // CuraEngine CLI args are different, often requiring -s for settings
                     // Example: curaengine slice -v -j cura_settings.json -s layer_height=0.2 -o output.gcode -l input.stl
@@ -801,6 +968,7 @@ export class STLManipulator extends EventEmitter {
                         args.push('-j', slicerProfile); // Load settings from profile definition file
                     }
                     break;
+                case 'orcaslicer':
                 case 'bambustudio':
                     // Bambu Studio CLI: slice and export as 3MF with embedded gcode
                     // For 3MF input: slice in place and export sliced 3MF
@@ -809,23 +977,18 @@ export class STLManipulator extends EventEmitter {
                         const is3mf = stlFilePath.toLowerCase().endsWith('.3mf');
                         const outputBase = path.basename(stlFilePath, is3mf ? '.3mf' : '.stl');
                         const bambuOutputPath = path.join(this.tempDir, outputBase + '_sliced.3mf');
+                        const outputDir = path.dirname(bambuOutputPath);
+                        const settingsBundle = this.resolveBambuLikeSettingsBundle(outputBase, slicerType, slicerProfile, printerPreset, bambuOptions);
                         args = [
                             '--slice', String(bambuOptions?.slicePlate ?? 0),
-                            '--export-3mf', bambuOutputPath,
+                            '--outputdir', outputDir,
+                            '--export-3mf', path.basename(bambuOutputPath),
                         ];
-                        if (slicerProfile) {
-                            args.push('--load-settings', slicerProfile);
+                        if (settingsBundle.settingsArg) {
+                            args.push('--load-settings', settingsBundle.settingsArg);
                         }
                         // Always allow newer-version 3MF files (the CLI rejects them by default)
                         args.push('--allow-newer-file');
-                        // If a printer preset name is given AND no explicit profile was provided,
-                        // write a minimal settings JSON containing the printer_settings_id so
-                        // BambuStudio resolves the correct machine profile from its built-in presets.
-                        if (printerPreset && !slicerProfile) {
-                            const presetJson = path.join(this.tempDir, '_printer_preset.json');
-                            fs.writeFileSync(presetJson, JSON.stringify({ printer_settings_id: printerPreset }));
-                            args.push('--load-settings', presetJson);
-                        }
                         // BambuSliceOptions flags
                         if (bambuOptions?.uptodate)
                             args.push('--uptodate');
@@ -857,8 +1020,10 @@ export class STLManipulator extends EventEmitter {
                             args.push('--clone-objects', bambuOptions.cloneObjects);
                         if (bambuOptions?.skipObjects)
                             args.push('--skip-objects', bambuOptions.skipObjects);
-                        if (bambuOptions?.loadFilaments)
-                            args.push('--load-filaments', bambuOptions.loadFilaments);
+                        if (settingsBundle.filamentPaths.length > 0) {
+                            args.push('--load-filaments', settingsBundle.filamentPaths.join(';'));
+                            args.push('--load-defaultfila');
+                        }
                         if (bambuOptions?.loadFilamentIds)
                             args.push('--load-filament-ids', bambuOptions.loadFilamentIds);
                         args.push(stlFilePath);

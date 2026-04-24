@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -9,6 +11,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import JSZip from "jszip";
+import { analyzeCollarCharm3MF } from "../dist/3mf_parser.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -159,9 +163,23 @@ test("printer model safety: schema requires bambu_model, rejects missing/invalid
     print3mfTool.inputSchema.properties.bed_type,
     "print_3mf must have bed_type property"
   );
+  const collarCharmTool = listToolsResult.tools.find((t) => t.name === "print_collar_charm");
+  assert.ok(collarCharmTool, "print_collar_charm tool must exist");
+  assert.ok(
+    collarCharmTool.inputSchema.properties.template_name,
+    "print_collar_charm must accept template_name"
+  );
+  assert.ok(
+    collarCharmTool.inputSchema.properties.source_path,
+    "print_collar_charm must accept source_path"
+  );
+  assert.ok(
+    collarCharmTool.inputSchema.properties.bambu_model,
+    "print_collar_charm must have bambu_model property"
+  );
   assert.deepEqual(
     print3mfTool.inputSchema.properties.bambu_model.enum,
-    ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d"],
+    ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
     "print_3mf bambu_model must enumerate all valid models"
   );
 
@@ -254,6 +272,56 @@ test("printer model safety: BAMBU_MODEL env var accepted as default", async (t) 
     !errorText.includes("bambu_model") && !errorText.includes("BAMBU_MODEL"),
     `With BAMBU_MODEL env set, error should be about file not model, got: ${errorText}`
   );
+});
+
+test("collar charm analysis resolves smaller object to inner black tray and larger object to outer white tray", async () => {
+  const zip = new JSZip();
+  zip.file(
+    "Metadata/plate_1.json",
+    JSON.stringify({
+      bbox_objects: [
+        { area: 900, name: "outer_ring.stl" },
+        { area: 125, name: "inner_letter.stl" }
+      ],
+      filament_ids: [7, 3],
+      version: 2
+    })
+  );
+  const tempPath = path.join(os.tmpdir(), `collar-charm-${Date.now()}.3mf`);
+  fs.writeFileSync(tempPath, await zip.generateAsync({ type: "nodebuffer" }));
+
+  try {
+    const analysis = await analyzeCollarCharm3MF(tempPath, 0);
+    assert.deepEqual(analysis.usedFilamentPositions, [7, 3]);
+    assert.deepEqual(analysis.amsSlots, [5, 1], "ams_slots must line up with used filament order");
+    assert.equal(analysis.roles.find((role) => role.role === "inner")?.name, "inner_letter.stl");
+    assert.equal(analysis.roles.find((role) => role.role === "outer")?.name, "outer_ring.stl");
+  } finally {
+    fs.rmSync(tempPath, { force: true });
+  }
+});
+
+test("collar charm analysis rejects projects that do not resolve to exactly two objects", async () => {
+  const zip = new JSZip();
+  zip.file(
+    "Metadata/plate_1.json",
+    JSON.stringify({
+      bbox_objects: [{ area: 500, name: "only_one.stl" }],
+      filament_ids: [0],
+      version: 2
+    })
+  );
+  const tempPath = path.join(os.tmpdir(), `collar-charm-invalid-${Date.now()}.3mf`);
+  fs.writeFileSync(tempPath, await zip.generateAsync({ type: "nodebuffer" }));
+
+  try {
+    await assert.rejects(
+      () => analyzeCollarCharm3MF(tempPath, 0),
+      /requires exactly 2 plate objects/i
+    );
+  } finally {
+    fs.rmSync(tempPath, { force: true });
+  }
 });
 
 test("stdio transport: initialize, list tools, call success + structured failure", async (t) => {

@@ -10,6 +10,15 @@ interface BambuPrintOptionsInternal {
     layerInspect?: boolean;
     timelapse?: boolean;
     amsMapping?: number[];
+    /**
+     * Per-used-filament absolute tray index, one entry per position in the
+     * selected plate's `filament_ids`. Example: plate uses project filament 1
+     * only, and you want to pull from AMS 0 tray 1 -> pass `[1]`. The server
+     * expands this into the project-level `ams_mapping` array at the right
+     * position automatically (H2-series). Preferred over `amsMapping` for
+     * ergonomic callers; `amsMapping` takes precedence if both are set.
+     */
+    amsSlots?: number[];
     md5?: string;
 }
 export declare class BambuImplementation {
@@ -46,6 +55,7 @@ export declare class BambuImplementation {
      * again, resulting in e.g. /cache/cache/file.3mf).
      */
     private ftpUpload;
+    private waitForTlsSession;
     disconnectAll(): Promise<void>;
 }
 export {};
