@@ -796,6 +796,19 @@ Set a printer light node mode. Common Bambu firmware reports the chamber light a
 }
 ```
 
+#### skip_objects
+
+Skip specific object IDs during a running multi-object print. Use `list_3mf_plate_objects` on the sliced 3MF to find the IDs first.
+
+```json
+{
+  "object_ids": [6495, 6496],
+  "host": "192.168.1.100",
+  "bambu_serial": "01P00A123456789",
+  "bambu_token": "your_access_token"
+}
+```
+
 #### print_3mf
 
 The primary tool for starting a Bambu print. **Recommended input: a pre-sliced `.gcode.3mf` exported from Bambu Studio** — see [docs/SLICING.md](./docs/SLICING.md). This tool handles the complete workflow:
@@ -843,6 +856,17 @@ Dry-run the AMS match without uploading or starting a print. The tool reads `Met
   "host": "192.168.1.100",
   "bambu_serial": "094...",
   "bambu_token": "your_access_token"
+}
+```
+
+#### list_3mf_plate_objects
+
+List object IDs from a sliced 3MF plate. Use this before `skip_objects` so you pass real Bambu object IDs instead of display-order guesses.
+
+```json
+{
+  "three_mf_path": "/Users/yourname/Downloads/bracket.gcode.3mf",
+  "plate_index": 0
 }
 ```
 
@@ -1078,6 +1102,8 @@ After connecting the MCP server in Claude Desktop or Claude Code, you can ask Cl
 - "Set the bed to 65 degrees."
 - "Turn the chamber light on."
 - "Set the chamber fan to 40 percent."
+- "List the object IDs in this sliced 3MF."
+- "Skip object 6495 on the current print."
 
 ### Printing 3MF files
 

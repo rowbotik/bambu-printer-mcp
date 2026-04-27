@@ -85,3 +85,15 @@ export interface ThreeMFAmsRequirements {
     usedFilamentPositions: number[];
     filaments: ThreeMFFilamentRequirement[];
 }
+
+export interface ThreeMFPlateObject {
+    id: number;
+    name: string;
+    area: number | null;
+    bbox: unknown;
+}
+
+export interface ThreeMFPlateObjects {
+    plateIndex: number;
+    objects: ThreeMFPlateObject[];
+}

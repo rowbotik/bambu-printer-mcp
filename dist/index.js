@@ -9,7 +9,7 @@ import path from "path";
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { STLManipulator } from "./stl/stl-manipulator.js";
-import { analyze3MFAmsRequirements, analyzeCollarCharm3MF, extractBambuTemplateSettings, getCollarCharmRolePolicy, parse3MF } from './3mf_parser.js';
+import { analyze3MFAmsRequirements, analyze3MFPlateObjects, analyzeCollarCharm3MF, extractBambuTemplateSettings, getCollarCharmRolePolicy, parse3MF } from './3mf_parser.js';
 import { BambuImplementation } from "./printers/bambu.js";
 dotenv.config();
 const DEFAULT_HOST = process.env.BAMBU_PRINTER_HOST || process.env.PRINTER_HOST || "localhost";
@@ -797,6 +797,18 @@ class BambuPrinterMCPServer {
                         }
                     },
                     {
+                        name: "list_3mf_plate_objects",
+                        description: "List object IDs from a sliced 3MF plate. Use these IDs with skip_objects during a running print.",
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                three_mf_path: { type: "string", description: "Path to a sliced 3MF/.gcode.3mf file" },
+                                plate_index: { type: "number", description: "0-based plate index to inspect (default: 0)" }
+                            },
+                            required: ["three_mf_path"]
+                        }
+                    },
+                    {
                         name: "extend_stl_base",
                         description: "Extend the base of an STL file by a specified amount",
                         inputSchema: {
@@ -1142,6 +1154,24 @@ class BambuPrinterMCPServer {
                         }
                     },
                     {
+                        name: "skip_objects",
+                        description: "Skip specific object IDs during a running multi-object print using the printer's MQTT skip_objects command",
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                object_ids: {
+                                    type: "array",
+                                    description: "Object IDs to skip. Use list_3mf_plate_objects on the sliced 3MF to find IDs.",
+                                    items: { type: "number" }
+                                },
+                                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+                            },
+                            required: ["object_ids"]
+                        }
+                    },
+                    {
                         name: "print_3mf",
                         description: "Print a 3MF file on a Bambu Lab printer. Auto-slices if the 3MF has no gcode. IMPORTANT: bambu_model must be specified to ensure safe printer operation.",
                         inputSchema: {
@@ -1324,6 +1354,13 @@ class BambuPrinterMCPServer {
                         };
                         break;
                     }
+                    case "list_3mf_plate_objects": {
+                        if (!args?.three_mf_path) {
+                            throw new Error("Missing required parameter: three_mf_path");
+                        }
+                        result = await analyze3MFPlateObjects(String(args.three_mf_path), args?.plate_index !== undefined ? Number(args.plate_index) : 0);
+                        break;
+                    }
                     case "list_templates":
                         result = this.listTemplateRegistry(requestedTemplateDir);
                         break;
@@ -1383,6 +1420,12 @@ class BambuPrinterMCPServer {
                             throw new Error("Missing required parameters: light and mode");
                         }
                         result = await this.bambu.setLight(host, bambuSerial, bambuToken, String(args.light), String(args.mode));
+                        break;
+                    case "skip_objects":
+                        if (!Array.isArray(args?.object_ids)) {
+                            throw new Error("Missing required parameter: object_ids");
+                        }
+                        result = await this.bambu.skipObjects(host, bambuSerial, bambuToken, args.object_ids.map((id) => Number(id)));
                         break;
                     case "extend_stl_base":
                         if (!args?.stl_path || args?.extension_height === undefined) {

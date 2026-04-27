@@ -1,6 +1,6 @@
 import JSZip from 'jszip';
 import { parseStringPromise } from 'xml2js';
-import { ThreeMFData, BambuSlicerConfig, ThreeMFMetadata, ThreeMFObject, ThreeMFBuildItem, AMSFilamentMapping, CollarCharmAnalysis, CollarCharmRole, ThreeMFAmsRequirements } from './types.js';
+import { ThreeMFData, BambuSlicerConfig, ThreeMFMetadata, ThreeMFObject, ThreeMFBuildItem, AMSFilamentMapping, CollarCharmAnalysis, CollarCharmRole, ThreeMFAmsRequirements, ThreeMFPlateObjects } from './types.js';
 import * as fs from 'fs/promises';
 
 // Parses Bambu Studio's JSON config data
@@ -441,5 +441,38 @@ export async function analyze3MFAmsRequirements(
                 color: filament?.color ?? null,
             };
         }),
+    };
+}
+
+export async function analyze3MFPlateObjects(
+    filePath: string,
+    plateIndex: number = 0
+): Promise<ThreeMFPlateObjects> {
+    const data = await fs.readFile(filePath);
+    const zip = await JSZip.loadAsync(data);
+    const plateName = `Metadata/plate_${plateIndex + 1}.json`;
+    const plateFile = zip.file(plateName);
+
+    if (!plateFile) {
+        throw new Error(`3MF is missing ${plateName}; cannot list plate objects.`);
+    }
+
+    const plateJson = JSON.parse(await plateFile.async('string'));
+    const bboxObjects = Array.isArray(plateJson?.bbox_objects) ? plateJson.bbox_objects : [];
+
+    return {
+        plateIndex,
+        objects: bboxObjects
+            .map((object: any) => {
+                const id = Number(object?.id);
+                if (!Number.isInteger(id)) return null;
+                return {
+                    id,
+                    name: typeof object?.name === 'string' ? object.name : `object_${id}`,
+                    area: Number.isFinite(Number(object?.area)) ? Number(object.area) : null,
+                    bbox: object?.bbox ?? null,
+                };
+            })
+            .filter((object: unknown): object is NonNullable<typeof object> => object !== null),
     };
 }

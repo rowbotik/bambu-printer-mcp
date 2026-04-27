@@ -12,7 +12,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import JSZip from "jszip";
-import { analyze3MFAmsRequirements, analyzeCollarCharm3MF } from "../dist/3mf_parser.js";
+import { analyze3MFAmsRequirements, analyze3MFPlateObjects, analyzeCollarCharm3MF } from "../dist/3mf_parser.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -83,8 +83,10 @@ function assertCommonToolPresence(listToolsResult) {
   const names = listToolsResult.tools.map((tool) => tool.name);
   assert.ok(names.includes("get_printer_status"));
   assert.ok(names.includes("resolve_3mf_ams_slots"));
+  assert.ok(names.includes("list_3mf_plate_objects"));
   assert.ok(names.includes("set_fan_speed"));
   assert.ok(names.includes("set_light"));
+  assert.ok(names.includes("skip_objects"));
   assert.ok(names.includes("get_stl_info"));
   assert.ok(names.includes("blender_mcp_edit_model"));
   assert.ok(names.includes("print_3mf"), "print_3mf tool must be registered");
@@ -268,6 +270,26 @@ test("3MF AMS requirement analysis maps plate filament_ids to slice_info tray_in
         color: "#FFFFFF",
       },
     ]);
+  } finally {
+    fs.rmSync(tempPath, { force: true });
+  }
+});
+
+test("3MF plate object analysis lists Bambu object ids for skip_objects", async () => {
+  const fixture = path.join(REPO_ROOT, "tests/fixtures/h2d_gui_sliced");
+  const zip = new JSZip();
+  zip.file("Metadata/plate_1.json", fs.readFileSync(path.join(fixture, "plate_1.json"), "utf8"));
+  const tempPath = path.join(os.tmpdir(), `plate-objects-${Date.now()}.3mf`);
+  fs.writeFileSync(tempPath, await zip.generateAsync({ type: "nodebuffer" }));
+
+  try {
+    const plateObjects = await analyze3MFPlateObjects(tempPath, 0);
+    assert.equal(plateObjects.objects.length, 20);
+    assert.deepEqual(
+      plateObjects.objects.slice(0, 2).map((object) => object.id),
+      [6495, 6496]
+    );
+    assert.equal(plateObjects.objects[0].name, "mk2 collarID.stl_1");
   } finally {
     fs.rmSync(tempPath, { force: true });
   }

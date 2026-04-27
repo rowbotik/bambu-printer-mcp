@@ -894,6 +894,37 @@ export class BambuImplementation {
     };
   }
 
+  async skipObjects(
+    host: string,
+    serial: string,
+    token: string,
+    objectIds: number[]
+  ) {
+    const printer = await this.getPrinter(host, serial, token);
+    const normalizedObjectIds = objectIds
+      .map((id) => Math.trunc(id))
+      .filter((id) => Number.isInteger(id) && id >= 0);
+
+    if (normalizedObjectIds.length === 0) {
+      throw new Error("At least one non-negative object id is required.");
+    }
+
+    await printer.publish({
+      print: {
+        sequence_id: "0",
+        command: "skip_objects",
+        obj_list: normalizedObjectIds,
+      },
+    });
+    await sleep(COMMAND_SETTLE_MS);
+
+    return {
+      status: "success",
+      message: "Skip objects command sent.",
+      object_ids: normalizedObjectIds,
+    };
+  }
+
   async getFiles(host: string, serial: string, token: string) {
     const printer = new BambuPrinter(host, serial, token);
     const directories = ["cache", "timelapse", "logs"];

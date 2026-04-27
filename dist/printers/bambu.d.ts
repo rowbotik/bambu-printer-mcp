@@ -48,6 +48,11 @@ export declare class BambuImplementation {
         light: string;
         mode: string;
     }>;
+    skipObjects(host: string, serial: string, token: string, objectIds: number[]): Promise<{
+        status: string;
+        message: string;
+        object_ids: number[];
+    }>;
     getFiles(host: string, serial: string, token: string): Promise<{
         files: string[];
         directories: Record<string, string[]>;
