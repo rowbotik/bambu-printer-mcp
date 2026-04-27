@@ -29,6 +29,8 @@ export declare class BambuImplementation {
     getStatus(host: string, serial: string, token: string): Promise<any>;
     print3mf(host: string, serial: string, token: string, options: BambuPrintOptionsInternal): Promise<any>;
     cancelJob(host: string, serial: string, token: string): Promise<any>;
+    pauseJob(host: string, serial: string, token: string): Promise<any>;
+    resumeJob(host: string, serial: string, token: string): Promise<any>;
     setTemperature(host: string, serial: string, token: string, component: string, temperature: number): Promise<{
         status: string;
         message: string;

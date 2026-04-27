@@ -9,3 +9,7 @@ temp/
 .idea/
 .vscode/
 coverage/
+
+# Local credentials and private fixtures (never commit)
+bambu certs/
+docs/mk2 collarID.gcode.3mf.3mf.gcode.3mf

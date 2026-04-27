@@ -54,7 +54,7 @@ Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the c
 
 ## Description
 
-`bambu-printer-mcp` is a Model Context Protocol server that gives Claude (or any MCP client) direct control over Bambu Lab 3D printers. It handles the full workflow: manipulate an STL, auto-slice it with BambuStudio if needed, upload the resulting 3MF over FTPS, and start the print via an MQTT `project_file` command -- all without leaving your conversation.
+`bambu-printer-mcp` is a Model Context Protocol server that gives Claude (or any MCP client) direct control over Bambu Lab 3D printers. The verified end-to-end path is: **slice in Bambu Studio, export a `.gcode.3mf`, hand the path to `print_3mf`** — the server reads the slicer's metadata out of the 3MF, builds the correct AMS mapping, uploads over FTPS, and starts the print via an MQTT `project_file` command. See [docs/SLICING.md](./docs/SLICING.md) for the full recipe and why in-process slicing is not the recommended path.
 
 **What this is not.** This package intentionally supports only Bambu Lab printers. It does not include adapters for OctoPrint, Klipper (Moonraker), Duet, Repetier, Prusa Connect, or Creality Cloud. If you need multi-printer support, use the parent project [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server) instead.
 
@@ -69,10 +69,10 @@ Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the c
 - Get detailed printer status: temperatures (nozzle, bed, chamber), print progress, current layer, time remaining, and live AMS slot data
 - Query live AMS inventory with resolved Bambu/Orca filament profile paths via `get_printer_filaments`
 - List, upload, and manage files on the printer's SD card via FTPS
-- Upload and print `.3mf` files with full plate selection and calibration flag control
-- Automatic slicing: pass an unsliced 3MF to `print_3mf` and the server will slice it with BambuStudio CLI (or another configured slicer) before uploading
-- Parse AMS mapping from the 3MF's embedded slicer config (`Metadata/project_settings.config`) and send it correctly formatted per the OpenBambuAPI spec
-- Cancel in-progress print jobs via MQTT
+- Upload and print pre-sliced `.gcode.3mf` files with full plate selection and calibration flag control (recommended path — see [docs/SLICING.md](./docs/SLICING.md))
+- Optional auto-slice path via BambuStudio CLI. Set `BAMBU_CLI_FLATTEN=true` to enable a workaround that flattens BBL profile inheritance before invoking the CLI — works around upstream bugs in BambuStudio CLI mode ([#9636](https://github.com/bambulab/BambuStudio/issues/9636), [#9968](https://github.com/bambulab/BambuStudio/issues/9968)). Verified on H2S/H2D/X1C/P1S. Default off; Path A (GUI-slice) remains the recommended workflow for non-BBL profiles or first-time prints. See [docs/SLICING.md](./docs/SLICING.md).
+- Parse AMS mapping from the 3MF's embedded slicer metadata (`Metadata/plate_<n>.json` + gcode filament header) and send it correctly formatted per the OpenBambuAPI spec
+- Cancel, pause, and resume in-progress print jobs via MQTT
 - Set nozzle and bed temperature via G-code dispatch over MQTT
 - Start G-code files already stored on the printer
 - STL manipulation: scale, rotate, extend base, merge vertices, center at origin, lay flat, and inspect model info
@@ -193,6 +193,8 @@ BLENDER_MCP_BRIDGE_COMMAND=       # Shell command to invoke your Blender MCP bri
 | `MCP_HTTP_JSON_RESPONSE` | `true` | No | Return structured JSON alongside text responses |
 | `MCP_HTTP_ALLOWED_ORIGINS` | | No | Comma-separated list of allowed CORS origins |
 | `BLENDER_MCP_BRIDGE_COMMAND` | | No | Command to invoke Blender MCP bridge |
+| `BAMBU_CLI_FLATTEN` | `false` | No | When `true`, the MCP flattens BBL profile inheritance before invoking the BambuStudio CLI. Workaround for upstream issues [#9636](https://github.com/bambulab/BambuStudio/issues/9636) / [#9968](https://github.com/bambulab/BambuStudio/issues/9968). BBL printers only. Verified on H2S/H2D/X1C/P1S. See [docs/SLICING.md](./docs/SLICING.md). |
+| `BAMBU_PROFILES_ROOT` | derived from `SLICER_PATH` | No | Override path to the BambuStudio `Resources/profiles` directory used by the CLI flattener. Useful for non-standard installs or dev environments. |
 
 ---
 
@@ -718,7 +720,31 @@ If `filename` does not include a directory prefix, the server prepends `cache/` 
 
 #### cancel_print
 
-Cancel the currently running print job. Sends an `UpdateState` MQTT command with `state: "stop"`.
+Cancel the currently running print job. Sends an `UpdateState` MQTT command with `state: "stop"`. Not resumable — use `pause_print` if you may want to continue.
+
+```json
+{
+  "host": "192.168.1.100",
+  "bambu_serial": "01P00A123456789",
+  "bambu_token": "your_access_token"
+}
+```
+
+#### pause_print
+
+Pause the currently running print job. Sends an `UpdateState` MQTT command with `state: "pause"`. Resumable via `resume_print`.
+
+```json
+{
+  "host": "192.168.1.100",
+  "bambu_serial": "01P00A123456789",
+  "bambu_token": "your_access_token"
+}
+```
+
+#### resume_print
+
+Resume a paused print job. Sends an `UpdateState` MQTT command with `state: "resume"`.
 
 ```json
 {
@@ -744,10 +770,10 @@ Set the target temperature for the bed or nozzle. Dispatches an M140 (bed) or M1
 
 #### print_3mf
 
-The primary tool for starting a Bambu print. This tool handles the complete workflow:
+The primary tool for starting a Bambu print. **Recommended input: a pre-sliced `.gcode.3mf` exported from Bambu Studio** — see [docs/SLICING.md](./docs/SLICING.md). This tool handles the complete workflow:
 
 1. Checks whether the 3MF contains embedded G-code (`Metadata/plate_<n>.gcode` entries).
-2. If no G-code is found, automatically slices the file using the configured slicer before proceeding.
+2. If no G-code is found, attempts to auto-slice via the configured slicer. This fallback is unreliable in practice (stale profiles, leftover multi-filament declarations) — prefer pre-slicing in Bambu Studio.
 3. Parses the sliced 3MF to extract the correct plate file and compute its MD5 hash.
 4. Also parses `Metadata/project_settings.config` to read AMS mapping embedded by Bambu Studio.
 5. Uploads the 3MF to the printer's `cache/` directory via FTPS using `basic-ftp` directly (avoiding the bambu-js double-path bug).
@@ -778,7 +804,7 @@ Layer height, nozzle temperature, and other slicer parameters cannot be overridd
 
 #### print_collar_charm
 
-High-level wrapper for the Kingpin dog-collar-charm workflow. This tool is intentionally specialized: it expects a prepared two-part charm project and applies the fixed tray policy you defined for Kingpin.
+High-level wrapper for a prepared two-part dog-collar-charm workflow. This tool is intentionally specialized: it expects a prepared two-part charm project and applies a fixed tray policy.
 
 - Smaller inner object -> black -> AMS 1 slot 1
 - Larger outer object -> white -> AMS 2 slot 1
@@ -823,9 +849,11 @@ If the project does not match those assumptions, the tool fails fast with a stru
 
 ### Slicing Tools
 
+> **Note:** the verified workflow is to slice in Bambu Studio (GUI) and feed the resulting `.gcode.3mf` to `print_3mf`. The CLI-driven slicing tools below (`slice_stl`, `slice_with_template`) work but are sensitive to profile drift and are not the recommended path for production prints. See [docs/SLICING.md](./docs/SLICING.md).
+
 #### list_templates
 
-List saved templates from the local registry directory. By default this is `~/Sync/bambu/templates`, or you can override it with `BAMBU_TEMPLATE_DIR`.
+List saved templates from the local registry directory. You can override the registry root with `BAMBU_TEMPLATE_DIR`.
 
 ```json
 {}
@@ -889,7 +917,7 @@ Slice an STL or 3MF file using an external slicer and return the path to the out
 
 `slicer_path` and `slicer_profile` fall back to the `SLICER_PATH` and `SLICER_PROFILE` environment variables when omitted.
 
-You can provide either `template_3mf_path` or `template_name` when you want to slice from a saved template. `template_name` resolves through the local template registry directory, which defaults to `~/Sync/bambu/templates`.
+You can provide either `template_3mf_path` or `template_name` when you want to slice from a saved template. `template_name` resolves through the local template registry directory configured for the server.
 
 For printing on a Bambu printer, the recommended workflow is: slice with `bambustudio` to get a sliced 3MF, then pass that output path to `print_3mf`.
 
@@ -1034,7 +1062,7 @@ After connecting the MCP server in Claude Desktop or Claude Code, you can ask Cl
 
 Understanding these constraints will help you avoid frustrating errors and set appropriate expectations.
 
-1. **Printable 3MF required for print_3mf.** The `print_3mf` tool expects a sliced 3MF containing at least one `Metadata/plate_<n>.gcode` entry. If you pass an unsliced 3MF (one exported from a CAD tool without slicing), the server will attempt to auto-slice it using the configured slicer. If auto-slicing fails, the tool errors out rather than sending an incomplete command to the printer.
+1. **Printable 3MF required for print_3mf.** The `print_3mf` tool expects a sliced 3MF containing at least one `Metadata/plate_<n>.gcode` entry. If you pass an unsliced 3MF (one exported from a CAD tool without slicing), the server will attempt to auto-slice it using the configured slicer — but this fallback is brittle and the recommended workflow is to pre-slice in Bambu Studio and pass the resulting `.gcode.3mf`. See [docs/SLICING.md](./docs/SLICING.md) for the full procedure.
 
 2. **Layer height, temperature, and slicer settings are baked in.** The `project_file` MQTT command tells the printer which plate to run. It does not support overriding layer height, temperature targets, infill percentage, or other slicing parameters at print time. These must be set in your slicer before generating the 3MF.
 

@@ -8,6 +8,7 @@ import { promisify } from 'util';
 import { EventEmitter } from 'events';
 import * as crypto from 'crypto';
 import { execFile } from 'child_process';
+import { flattenForCli, detectProfilesRoot } from '../slicer/profile-flatten.js';
 const readFileAsync = promisify(fs.readFile);
 const writeFileAsync = promisify(fs.writeFile);
 const BAMBU_PROFILE_ROOTS = [
@@ -210,6 +211,74 @@ export class STLManipulator extends EventEmitter {
             settingsArg: settingsParts.length > 0 ? settingsParts.join(';') : undefined,
             filamentPaths: Array.from(new Set(filamentPaths)),
         };
+    }
+    /**
+     * Optionally rewrite a Bambu-like settings bundle so the paths point at
+     * fully-flattened temp configs instead of the BBL-shipped leaf JSONs.
+     *
+     * BambuStudio's CLI does not resolve the `inherits` chain when loading
+     * profiles via --load-settings / --load-filaments, which causes a
+     * cluster of upstream bugs (see https://github.com/bambulab/BambuStudio/issues/9636
+     * and #9968). Our flattener (src/slicer/profile-flatten.ts) reproduces
+     * what the GUI does at slice time so the CLI accepts the configs.
+     *
+     * Opt-in via `BAMBU_CLI_FLATTEN=true`. When the env var is unset or
+     * not "true"/"1", returns the bundle unchanged so behavior is
+     * backward-compatible. When enabled, only BBL-shipped leaves get
+     * flattened; user-provided custom configs pass through untouched.
+     */
+    async maybeFlattenBundle(bundle) {
+        const flag = process.env.BAMBU_CLI_FLATTEN;
+        if (flag !== 'true' && flag !== '1')
+            return bundle;
+        if (!bundle.settingsArg)
+            return bundle;
+        // settingsArg is "machine.json;process.json".
+        const parts = bundle.settingsArg.split(';').filter(Boolean);
+        if (parts.length < 2)
+            return bundle;
+        const [machinePath, processPath] = parts;
+        // Pull leaf names from each JSON's `name` field. If any is missing or
+        // looks non-BBL (e.g. a user-saved custom config), bail out and
+        // return the original bundle untouched.
+        const machineLeaf = this.readLeafName(machinePath);
+        const processLeaf = this.readLeafName(processPath);
+        const filamentLeaves = bundle.filamentPaths
+            .map((p) => this.readLeafName(p))
+            .filter((n) => Boolean(n));
+        if (!machineLeaf || !processLeaf || filamentLeaves.length === 0) {
+            console.log('[cli-flatten] skipping: could not derive BBL leaf names from bundle paths');
+            return bundle;
+        }
+        try {
+            const profilesRoot = detectProfilesRoot(process.env.SLICER_PATH);
+            const flat = await flattenForCli({
+                machineLeaf,
+                processLeaf,
+                filamentLeaves,
+                profilesRoot,
+                tempDir: this.tempDir,
+            });
+            console.log(`[cli-flatten] applied for ${machineLeaf} (cliOverlay=${flat.meta.cliOverlayApplied})`);
+            return {
+                settingsArg: `${flat.machinePath};${flat.processPath}`,
+                filamentPaths: flat.filamentPaths,
+            };
+        }
+        catch (err) {
+            console.error(`[cli-flatten] failed, falling back to unflattened bundle: ${err?.message ?? err}`);
+            return bundle;
+        }
+    }
+    /** Read a profile JSON's top-level `name` field, or null if unreadable. */
+    readLeafName(filePath) {
+        try {
+            const data = this.readJsonFile(filePath);
+            return typeof data?.name === 'string' && data.name.length > 0 ? data.name : null;
+        }
+        catch {
+            return null;
+        }
     }
     /**
      * Load STL file and return geometry and bounding box
@@ -978,7 +1047,12 @@ export class STLManipulator extends EventEmitter {
                         const outputBase = path.basename(stlFilePath, is3mf ? '.3mf' : '.stl');
                         const bambuOutputPath = path.join(this.tempDir, outputBase + '_sliced.3mf');
                         const outputDir = path.dirname(bambuOutputPath);
-                        const settingsBundle = this.resolveBambuLikeSettingsBundle(outputBase, slicerType, slicerProfile, printerPreset, bambuOptions);
+                        const rawBundle = this.resolveBambuLikeSettingsBundle(outputBase, slicerType, slicerProfile, printerPreset, bambuOptions);
+                        // Opt-in flatten step: walks the BBL `inherits` chain so the
+                        // CLI accepts what we hand it. See maybeFlattenBundle docstring.
+                        const settingsBundle = slicerType === 'bambustudio'
+                            ? await this.maybeFlattenBundle(rawBundle)
+                            : rawBundle;
                         args = [
                             '--slice', String(bambuOptions?.slicePlate ?? 0),
                             '--outputdir', outputDir,

@@ -1026,7 +1026,7 @@ class BambuPrinterMCPServer {
               properties: {
                 template_dir: {
                   type: "string",
-                  description: "Optional template directory override. Defaults to BAMBU_TEMPLATE_DIR or ~/Sync/bambu/templates."
+                  description: "Optional template directory override. Defaults to BAMBU_TEMPLATE_DIR or the server's configured local template registry."
                 }
               }
             }
@@ -1047,7 +1047,7 @@ class BambuPrinterMCPServer {
                 },
                 template_dir: {
                   type: "string",
-                  description: "Optional template directory override. Defaults to BAMBU_TEMPLATE_DIR or ~/Sync/bambu/templates."
+                  description: "Optional template directory override. Defaults to BAMBU_TEMPLATE_DIR or the server's configured local template registry."
                 }
               },
               required: ["source_path"]
@@ -1234,6 +1234,30 @@ class BambuPrinterMCPServer {
             }
           },
           {
+            name: "pause_print",
+            description: "Pause the current print job on the Bambu Lab printer (resumable via resume_print)",
+            inputSchema: {
+              type: "object",
+              properties: {
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              }
+            }
+          },
+          {
+            name: "resume_print",
+            description: "Resume a paused print job on the Bambu Lab printer",
+            inputSchema: {
+              type: "object",
+              properties: {
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              }
+            }
+          },
+          {
             name: "set_temperature",
             description: "Set the temperature of a printer component (bed, nozzle)",
             inputSchema: {
@@ -1294,7 +1318,7 @@ class BambuPrinterMCPServer {
           },
           {
             name: "print_collar_charm",
-            description: "Print a prepared two-part dog collar charm project on Kingpin/H2 using the fixed tray policy: inner/smaller object -> black on AMS 1 slot 1, outer/larger object -> white on AMS 2 slot 1.",
+            description: "Print a prepared two-part dog collar charm project using the fixed tray policy: inner/smaller object -> black on AMS 1 slot 1, outer/larger object -> white on AMS 2 slot 1.",
             inputSchema: {
               type: "object",
               properties: {
@@ -1304,7 +1328,7 @@ class BambuPrinterMCPServer {
                 bambu_model: {
                   type: "string",
                   enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
-                  description: "REQUIRED: Bambu Lab printer model. For this wrapper, H2D on Kingpin is the intended path."
+                  description: "REQUIRED: Bambu Lab printer model. H2D and H2S are the primary intended paths."
                 },
                 host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
                 bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
@@ -1477,6 +1501,14 @@ class BambuPrinterMCPServer {
 
           case "cancel_print":
             result = await this.bambu.cancelJob(host, bambuSerial, bambuToken);
+            break;
+
+          case "pause_print":
+            result = await this.bambu.pauseJob(host, bambuSerial, bambuToken);
+            break;
+
+          case "resume_print":
+            result = await this.bambu.resumeJob(host, bambuSerial, bambuToken);
             break;
 
           case "set_temperature":

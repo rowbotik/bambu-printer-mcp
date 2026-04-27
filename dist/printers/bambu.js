@@ -626,6 +626,26 @@ export class BambuImplementation {
             throw new Error(`Failed to cancel print: ${error.message}`);
         }
     }
+    async pauseJob(host, serial, token) {
+        const printer = await this.getPrinter(host, serial, token);
+        try {
+            await invokeWithoutAck(printer, new UpdateStateCommand({ state: "pause" }));
+            return { status: "success", message: "Pause command sent successfully." };
+        }
+        catch (error) {
+            throw new Error(`Failed to pause print: ${error.message}`);
+        }
+    }
+    async resumeJob(host, serial, token) {
+        const printer = await this.getPrinter(host, serial, token);
+        try {
+            await invokeWithoutAck(printer, new UpdateStateCommand({ state: "resume" }));
+            return { status: "success", message: "Resume command sent successfully." };
+        }
+        catch (error) {
+            throw new Error(`Failed to resume print: ${error.message}`);
+        }
+    }
     async setTemperature(host, serial, token, component, temperature) {
         const printer = await this.getPrinter(host, serial, token);
         const normalizedComponent = component.toLowerCase();

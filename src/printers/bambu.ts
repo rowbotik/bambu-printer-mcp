@@ -759,6 +759,26 @@ export class BambuImplementation {
     }
   }
 
+  async pauseJob(host: string, serial: string, token: string): Promise<any> {
+    const printer = await this.getPrinter(host, serial, token);
+    try {
+      await invokeWithoutAck(printer, new UpdateStateCommand({ state: "pause" }));
+      return { status: "success", message: "Pause command sent successfully." };
+    } catch (error) {
+      throw new Error(`Failed to pause print: ${(error as Error).message}`);
+    }
+  }
+
+  async resumeJob(host: string, serial: string, token: string): Promise<any> {
+    const printer = await this.getPrinter(host, serial, token);
+    try {
+      await invokeWithoutAck(printer, new UpdateStateCommand({ state: "resume" }));
+      return { status: "success", message: "Resume command sent successfully." };
+    } catch (error) {
+      throw new Error(`Failed to resume print: ${(error as Error).message}`);
+    }
+  }
+
   async setTemperature(
     host: string,
     serial: string,
