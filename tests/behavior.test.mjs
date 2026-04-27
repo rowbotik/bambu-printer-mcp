@@ -518,6 +518,71 @@ test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", asyn
   }
 });
 
+test("camera_snapshot fails fast for H2 series (undocumented protocol)", async () => {
+  const bambu = new BambuImplementation();
+  for (const model of ["h2", "h2s", "h2d"]) {
+    await assert.rejects(
+      bambu.cameraSnapshot("127.0.0.1", "S", "T", { bambuModel: model }),
+      /not documented upstream/i,
+      `expected undocumented-protocol error for ${model}`
+    );
+  }
+});
+
+test("camera_snapshot fails fast for X1/P2S series (RTSP not implemented)", async () => {
+  const bambu = new BambuImplementation();
+  for (const model of ["x1", "x1c", "x1e", "p2s"]) {
+    await assert.rejects(
+      bambu.cameraSnapshot("127.0.0.1", "S", "T", { bambuModel: model }),
+      /RTSP on port 322 which is not yet implemented/i,
+      `expected RTSP-not-implemented error for ${model}`
+    );
+  }
+});
+
+test("camera_snapshot rejects unknown model strings", async () => {
+  const bambu = new BambuImplementation();
+  await assert.rejects(
+    bambu.cameraSnapshot("127.0.0.1", "S", "T", { bambuModel: "ender3" }),
+    /not a known Bambu Lab printer model/i
+  );
+});
+
+test("camera_snapshot supported models reach the wire path (mocked) and decode a JPEG frame", async () => {
+  const bambu = new BambuImplementation();
+
+  // Stub the private wire fetcher so we can verify the routing without
+  // talking to a real printer. Returns a tiny synthetic JPEG.
+  const fakeJpeg = Buffer.from([0xff, 0xd8, 0x00, 0x11, 0x22, 0xff, 0xd9]);
+  bambu.fetchTcpCameraFrame = async () => fakeJpeg;
+
+  for (const model of ["a1", "a1mini", "p1s", "p1p"]) {
+    const out = await bambu.cameraSnapshot("127.0.0.1", "S", "T", { bambuModel: model });
+    assert.equal(out.status, "success", `${model} should succeed`);
+    assert.equal(out.format, "image/jpeg");
+    assert.equal(out.sizeBytes, fakeJpeg.length);
+    assert.equal(out.base64, fakeJpeg.toString("base64"));
+  }
+});
+
+test("camera_snapshot save_path writes the jpeg to disk", async (t) => {
+  const bambu = new BambuImplementation();
+  const fakeJpeg = Buffer.from([0xff, 0xd8, 0x42, 0x42, 0xff, 0xd9]);
+  bambu.fetchTcpCameraFrame = async () => fakeJpeg;
+
+  const outPath = path.join(os.tmpdir(), `snap-${Date.now()}.jpg`);
+  t.after(() => { fs.rmSync(outPath, { force: true }); });
+
+  const out = await bambu.cameraSnapshot("127.0.0.1", "S", "T", {
+    bambuModel: "p1s",
+    savePath: outPath,
+  });
+
+  assert.equal(out.savedTo, outPath);
+  const onDisk = fs.readFileSync(outPath);
+  assert.deepEqual(Buffer.from(onDisk), fakeJpeg);
+});
+
 test("delete_printer_file requires confirm:true and skips FTP when omitted", async () => {
   const bambu = new BambuImplementation();
   let ftpCalled = false;

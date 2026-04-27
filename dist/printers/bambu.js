@@ -911,6 +911,133 @@ export class BambuImplementation {
         };
     }
     /**
+     * Capture a single JPEG frame from the printer's chamber camera.
+     *
+     * Protocol per https://github.com/Doridian/OpenBambuAPI/blob/main/video.md
+     *
+     *   Connect TLS to <host>:6000 (self-signed cert -- skip verification).
+     *   Send an 80-byte auth packet:
+     *     [0..4]   uint32 LE  payload size = 0x40  (64)
+     *     [4..8]   uint32 LE  type         = 0x3000
+     *     [8..12]  uint32 LE  flags        = 0
+     *     [12..16] uint32 LE  0
+     *     [16..48] "bblp" + null padding to 32 bytes
+     *     [48..80] access token + null padding to 32 bytes
+     *
+     *   The server then streams frames as repeating:
+     *     [0..4]   uint32 LE  payload size
+     *     [4..8]   uint32 LE  itrack (0)
+     *     [8..12]  uint32 LE  flags  (1)
+     *     [12..16] uint32 LE  0
+     *     [16..16+payloadSize] JPEG (FF D8 ... FF D9)
+     *
+     * Verified models per upstream docs: A1, A1 mini, P1S, P1P. X1/X1C/X1E
+     * and P2S use RTSP on port 322 instead -- not implemented yet. H2/H2S/H2D
+     * are not documented; we fail fast rather than guess at the protocol.
+     *
+     * Read-only; no confirm gate. Default 8s timeout for cold-start latency.
+     */
+    async cameraSnapshot(host, _serial, token, options = {}) {
+        const timeoutMs = options.timeoutMs ?? 8000;
+        const model = (options.bambuModel ?? "").toLowerCase();
+        const TCP_CAMERA_MODELS = new Set(["a1", "a1mini", "p1s", "p1p"]);
+        const RTSP_MODELS = new Set(["x1", "x1c", "x1carbon", "x1e", "p2s"]);
+        const UNDOCUMENTED_MODELS = new Set(["h2", "h2s", "h2d"]);
+        if (UNDOCUMENTED_MODELS.has(model)) {
+            throw new Error(`camera_snapshot: H2 series camera protocol is not documented upstream and not yet verified. Refusing to send a guess at the wire format. Track https://github.com/Doridian/OpenBambuAPI/blob/main/video.md for updates.`);
+        }
+        if (RTSP_MODELS.has(model)) {
+            throw new Error(`camera_snapshot: ${model.toUpperCase()} uses RTSP on port 322 which is not yet implemented in this MCP. Use OctoEverywhere or rtsps://bblp:<token>@${host}:322/streaming/live/1 directly.`);
+        }
+        if (model && !TCP_CAMERA_MODELS.has(model)) {
+            throw new Error(`camera_snapshot: model "${model}" is not a known Bambu Lab printer model. Supported on this code path: ${[...TCP_CAMERA_MODELS].join(", ")}`);
+        }
+        const jpeg = await this.fetchTcpCameraFrame(host, token, timeoutMs);
+        const result = {
+            status: "success",
+            format: "image/jpeg",
+            sizeBytes: jpeg.length,
+            base64: jpeg.toString("base64"),
+        };
+        if (options.savePath) {
+            const fsSync = await import("node:fs");
+            fsSync.writeFileSync(options.savePath, jpeg);
+            result.savedTo = options.savePath;
+        }
+        return result;
+    }
+    /**
+     * Open the TLS-on-6000 socket, send the 80-byte auth packet, and read
+     * a single complete JPEG frame. Returns the JPEG bytes.
+     */
+    async fetchTcpCameraFrame(host, token, timeoutMs) {
+        const tls = await import("node:tls");
+        const auth = Buffer.alloc(80, 0);
+        auth.writeUInt32LE(0x40, 0); // payload size
+        auth.writeUInt32LE(0x3000, 4); // type
+        // flags=0, reserved=0 are already zero from Buffer.alloc.
+        auth.write("bblp", 16, 4, "ascii");
+        auth.write(token, 48, Math.min(32, Buffer.byteLength(token, "ascii")), "ascii");
+        return new Promise((resolve, reject) => {
+            const chunks = [];
+            let totalLen = 0;
+            const FRAME_HEADER_BYTES = 16;
+            let payloadSize = null;
+            let settled = false;
+            const finish = (err, jpeg) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                socket.destroy();
+                if (err)
+                    reject(err);
+                else if (jpeg)
+                    resolve(jpeg);
+                else
+                    reject(new Error("camera_snapshot: ended without jpeg payload"));
+            };
+            const timer = setTimeout(() => finish(new Error(`camera_snapshot: timed out after ${timeoutMs}ms`)), timeoutMs);
+            const socket = tls.connect({
+                host,
+                port: 6000,
+                rejectUnauthorized: false,
+                // The printer uses TLS for confidentiality but presents a self-signed cert.
+                // Same trust posture as the FTPS path (basic-ftp with rejectUnauthorized: false).
+            }, () => {
+                socket.write(auth);
+            });
+            socket.on("data", (data) => {
+                chunks.push(data);
+                totalLen += data.length;
+                if (payloadSize === null && totalLen >= FRAME_HEADER_BYTES) {
+                    const merged = Buffer.concat(chunks, totalLen);
+                    payloadSize = merged.readUInt32LE(0);
+                    if (payloadSize <= 0 || payloadSize > 5000000) {
+                        finish(new Error(`camera_snapshot: unreasonable payload size ${payloadSize} from header; auth likely failed.`));
+                        return;
+                    }
+                    // Reset chunk list to remaining bytes after the header.
+                    const remainder = merged.subarray(FRAME_HEADER_BYTES);
+                    chunks.length = 0;
+                    chunks.push(remainder);
+                    totalLen = remainder.length;
+                }
+                if (payloadSize !== null && totalLen >= payloadSize) {
+                    const merged = Buffer.concat(chunks, totalLen);
+                    const jpeg = merged.subarray(0, payloadSize);
+                    if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8) {
+                        finish(new Error(`camera_snapshot: payload does not start with JPEG SOI (FF D8); got ${jpeg[0].toString(16)} ${jpeg[1].toString(16)}.`));
+                        return;
+                    }
+                    finish(null, jpeg);
+                }
+            });
+            socket.on("error", (err) => finish(err));
+            socket.on("end", () => finish(new Error("camera_snapshot: connection ended before a full JPEG frame arrived")));
+        });
+    }
+    /**
      * Delete a single file from the printer's SD card via FTPS.
      *
      * Destructive. Caller MUST set confirm=true; otherwise we return without

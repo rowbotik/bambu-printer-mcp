@@ -2,11 +2,41 @@
 
 ## Latest commit (2026-04-27)
 
-`12ae6b9 fix(h2): require explicit AMS mapping; reject SuperTack on CLI slicing`
-landed on `codex/collar-charm-h2-cleanup` (not pushed). Stacked on top:
-new `delete_printer_file` MCP tool with confirm-gate + path-allowlist
-guard rails. `npm test` now passes **28/28** (added 5 unit tests for the
-delete behavior). Not committed yet — see "Working state" below.
+Branch `codex/collar-charm-h2-cleanup` (not pushed). Stack:
+
+```
+1838855 feat: add delete_printer_file MCP tool
+12ae6b9 fix(h2): require explicit AMS mapping; reject SuperTack on CLI slicing
+```
+
+On top of those: new `camera_snapshot` MCP tool — TCP-on-6000 JPEG frame
+fetch with strict per-model routing. **`npm test` now passes 33/33**
+(added 5 camera tests on top of the 5 delete tests landed in `1838855`).
+Not committed yet — see "Working state" below.
+
+### `camera_snapshot` — what shipped
+
+- Implements the OpenBambuAPI wire format (80-byte auth packet, 16-byte
+  frame header) for **A1 / A1 mini / P1S / P1P**. Verified against the
+  Doridian video.md spec.
+- **X1 / X1C / X1E / P2S** → fail-fast with a pointer at the RTSP URL
+  (`rtsps://bblp:<token>@<host>:322/streaming/live/1`). RTSP support is
+  deferred.
+- **H2 / H2S / H2D** → fail-fast: wire protocol is not documented
+  upstream and we refuse to guess. Same lesson as the SuperTack /
+  CLI-slicing path. Track upstream `video.md` and re-enable when verified.
+- Returns `{ status, format, sizeBytes, base64, savedTo? }`. Optional
+  `save_path` writes the bytes to disk in addition to returning base64.
+- Default 8s timeout for cold-start camera latency.
+
+### Why this won't help Parker today
+
+User's primary printer is H2S, which is in the undocumented bucket.
+`camera_snapshot` will refuse with a clear error there. This was a
+deliberate choice — shipping correctness rather than guessing at the
+wire format on a printer we can't easily test against. Future work:
+either reverse-engineer the H2 protocol from a packet capture or wait
+for upstream docs.
 
 ### Working state
 

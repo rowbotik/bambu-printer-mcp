@@ -72,6 +72,51 @@ export declare class BambuImplementation {
         file: string;
     }>;
     /**
+     * Capture a single JPEG frame from the printer's chamber camera.
+     *
+     * Protocol per https://github.com/Doridian/OpenBambuAPI/blob/main/video.md
+     *
+     *   Connect TLS to <host>:6000 (self-signed cert -- skip verification).
+     *   Send an 80-byte auth packet:
+     *     [0..4]   uint32 LE  payload size = 0x40  (64)
+     *     [4..8]   uint32 LE  type         = 0x3000
+     *     [8..12]  uint32 LE  flags        = 0
+     *     [12..16] uint32 LE  0
+     *     [16..48] "bblp" + null padding to 32 bytes
+     *     [48..80] access token + null padding to 32 bytes
+     *
+     *   The server then streams frames as repeating:
+     *     [0..4]   uint32 LE  payload size
+     *     [4..8]   uint32 LE  itrack (0)
+     *     [8..12]  uint32 LE  flags  (1)
+     *     [12..16] uint32 LE  0
+     *     [16..16+payloadSize] JPEG (FF D8 ... FF D9)
+     *
+     * Verified models per upstream docs: A1, A1 mini, P1S, P1P. X1/X1C/X1E
+     * and P2S use RTSP on port 322 instead -- not implemented yet. H2/H2S/H2D
+     * are not documented; we fail fast rather than guess at the protocol.
+     *
+     * Read-only; no confirm gate. Default 8s timeout for cold-start latency.
+     */
+    cameraSnapshot(host: string, _serial: string, token: string, options?: {
+        savePath?: string;
+        timeoutMs?: number;
+        bambuModel?: string;
+    }): Promise<{
+        status: string;
+        format: string;
+        sizeBytes: number;
+        base64: string;
+        savedTo?: string;
+        width?: number;
+        height?: number;
+    }>;
+    /**
+     * Open the TLS-on-6000 socket, send the 80-byte auth packet, and read
+     * a single complete JPEG frame. Returns the JPEG bytes.
+     */
+    private fetchTcpCameraFrame;
+    /**
      * Delete a single file from the printer's SD card via FTPS.
      *
      * Destructive. Caller MUST set confirm=true; otherwise we return without

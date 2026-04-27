@@ -69,6 +69,7 @@ Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the c
 - Get detailed printer status: temperatures (nozzle, bed, chamber), print progress, current layer, time remaining, and live AMS slot data
 - Query live AMS inventory with resolved Bambu/Orca filament profile paths via `get_printer_filaments`
 - List, upload, and delete files on the printer's SD card via FTPS
+- Capture a JPEG snapshot from the chamber camera (TCP-on-6000 path; A1 / P1 series only — see `camera_snapshot` for status)
 - Upload and print pre-sliced `.gcode.3mf` files with full plate selection and calibration flag control (recommended path — see [docs/SLICING.md](./docs/SLICING.md))
 - Optional auto-slice path via BambuStudio CLI. Set `BAMBU_CLI_FLATTEN=true` to enable a workaround that flattens BBL profile inheritance before invoking the CLI — works around upstream bugs in BambuStudio CLI mode ([#9636](https://github.com/bambulab/BambuStudio/issues/9636), [#9968](https://github.com/bambulab/BambuStudio/issues/9968)). Verified on H2S/H2D/X1C/P1S. Default off; Path A (GUI-slice) remains the recommended workflow for non-BBL profiles or first-time prints. See [docs/SLICING.md](./docs/SLICING.md).
 - Parse AMS mapping from the 3MF's embedded slicer metadata (`Metadata/plate_<n>.json` + gcode filament header) and send it correctly formatted per the OpenBambuAPI spec
@@ -677,6 +678,29 @@ List files stored on the printer's SD card. Scans the `cache/`, `timelapse/`, an
   "bambu_token": "your_access_token"
 }
 ```
+
+#### camera_snapshot
+
+Capture a single JPEG frame from the printer's chamber camera. Read-only.
+
+**Supported on this code path:** A1, A1 mini, P1S, P1P. Wire protocol per [OpenBambuAPI/video.md](https://github.com/Doridian/OpenBambuAPI/blob/main/video.md): TLS on port 6000, 80-byte auth packet (`bblp` + access token), repeating 16-byte frame header + JPEG payload.
+
+**Not yet supported:**
+- **X1 / X1 Carbon / X1E / P2S** — these use RTSP on port 322 (`rtsps://bblp:<token>@<host>:322/streaming/live/1`). Tool returns a clear error pointing at the URL until RTSP support lands.
+- **H2 / H2S / H2D** — wire protocol not documented upstream. Tool refuses rather than guess. Track [video.md](https://github.com/Doridian/OpenBambuAPI/blob/main/video.md) for updates.
+
+```json
+{
+  "save_path": "/tmp/snap.jpg",
+  "timeout_ms": 8000,
+  "bambu_model": "p1s",
+  "host": "192.168.1.100",
+  "bambu_serial": "01P00A123456789",
+  "bambu_token": "your_access_token"
+}
+```
+
+Returns `{ status, format: "image/jpeg", sizeBytes, base64, savedTo? }`. Pass `save_path` to also write the bytes to disk; otherwise only the base64 payload is returned.
 
 #### delete_printer_file
 

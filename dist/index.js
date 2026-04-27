@@ -1040,6 +1040,21 @@ class BambuPrinterMCPServer {
                         }
                     },
                     {
+                        name: "camera_snapshot",
+                        description: "Capture a single JPEG frame from the printer's chamber camera. TCP-on-6000 protocol (per OpenBambuAPI/video.md) — verified upstream for A1, A1 mini, P1S, P1P. X1/P2S use RTSP and are not yet supported. H2 series is undocumented and rejected with a clear error. Returns JPEG as base64; pass save_path to also write the bytes to disk.",
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                save_path: { type: "string", description: "Optional absolute path to write the JPEG to disk. If omitted, only the base64 payload is returned." },
+                                timeout_ms: { type: "number", description: "Max ms to wait for a full frame (default 8000). Camera may take a few seconds on cold start." },
+                                bambu_model: { type: "string", description: "Printer model. Used to route to the correct protocol or fail fast on unsupported models. Defaults to BAMBU_MODEL." },
+                                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+                            }
+                        }
+                    },
+                    {
                         name: "delete_printer_file",
                         description: "Delete a file from the Bambu Lab printer's SD card via FTPS. Destructive: requires confirm:true. Restricted to cache/, timelapse/, and logs/ directories. Path traversal segments (..) are rejected.",
                         inputSchema: {
@@ -1479,6 +1494,15 @@ class BambuPrinterMCPServer {
                     case "list_printer_files":
                         result = await this.bambu.getFiles(host, bambuSerial, bambuToken);
                         break;
+                    case "camera_snapshot": {
+                        const snapshotModel = args?.bambu_model ?? process.env.BAMBU_MODEL ?? process.env.BAMBU_PRINTER_MODEL;
+                        result = await this.bambu.cameraSnapshot(host, bambuSerial, bambuToken, {
+                            savePath: args?.save_path ? String(args.save_path) : undefined,
+                            timeoutMs: args?.timeout_ms !== undefined ? Number(args.timeout_ms) : undefined,
+                            bambuModel: snapshotModel ? String(snapshotModel) : undefined,
+                        });
+                        break;
+                    }
                     case "delete_printer_file":
                         if (!args?.filename) {
                             throw new Error("Missing required parameter: filename");
