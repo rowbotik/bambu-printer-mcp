@@ -1,4 +1,4 @@
-import { ThreeMFData, CollarCharmAnalysis } from './types.js';
+import { ThreeMFData, CollarCharmAnalysis, ThreeMFAmsRequirements } from './types.js';
 export { ThreeMFData };
 export declare function parse3MF(filePath: string): Promise<ThreeMFData>;
 export declare function extractBambuTemplateSettings(filePath: string, outputDir: string): Promise<string>;
@@ -13,3 +13,4 @@ export declare function getCollarCharmRolePolicy(): {
         readonly outer: 5;
     };
 };
+export declare function analyze3MFAmsRequirements(filePath: string, plateIndex?: number): Promise<ThreeMFAmsRequirements>;

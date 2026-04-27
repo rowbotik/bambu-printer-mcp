@@ -1,6 +1,6 @@
 import JSZip from 'jszip';
 import { parseStringPromise } from 'xml2js';
-import { ThreeMFData, BambuSlicerConfig, ThreeMFMetadata, ThreeMFObject, ThreeMFBuildItem, AMSFilamentMapping, CollarCharmAnalysis, CollarCharmRole } from './types.js';
+import { ThreeMFData, BambuSlicerConfig, ThreeMFMetadata, ThreeMFObject, ThreeMFBuildItem, AMSFilamentMapping, CollarCharmAnalysis, CollarCharmRole, ThreeMFAmsRequirements } from './types.js';
 import * as fs from 'fs/promises';
 
 // Parses Bambu Studio's JSON config data
@@ -364,5 +364,82 @@ export function getCollarCharmRolePolicy() {
     return {
         colors: COLLAR_CHARM_ROLE_COLORS,
         amsSlots: COLLAR_CHARM_ROLE_AMS_SLOTS,
+    };
+}
+
+export async function analyze3MFAmsRequirements(
+    filePath: string,
+    plateIndex: number = 0
+): Promise<ThreeMFAmsRequirements> {
+    const data = await fs.readFile(filePath);
+    const zip = await JSZip.loadAsync(data);
+    const plateNumber = plateIndex + 1;
+    const plateName = `Metadata/plate_${plateNumber}.json`;
+    const plateFile = zip.file(plateName);
+
+    if (!plateFile) {
+        throw new Error(`3MF is missing ${plateName}; cannot derive AMS filament order.`);
+    }
+
+    const plateJson = JSON.parse(await plateFile.async('string'));
+    const usedFilamentPositions = Array.isArray(plateJson?.filament_ids)
+        ? plateJson.filament_ids.filter((value: unknown) => Number.isInteger(value)).map((value: number) => value)
+        : [];
+
+    if (usedFilamentPositions.length === 0) {
+        throw new Error(`${plateName} does not declare filament_ids; cannot derive AMS filament order.`);
+    }
+
+    const sliceInfo = zip.file('Metadata/slice_info.config');
+    const filamentById = new Map<number, { tray_info_idx: string | null; type: string | null; color: string | null }>();
+
+    if (sliceInfo) {
+        const parsed = await parseStringPromise(await sliceInfo.async('string'), {
+            explicitArray: false,
+            mergeAttrs: true,
+        });
+        const plateNodes = parsed?.config?.plate
+            ? Array.isArray(parsed.config.plate) ? parsed.config.plate : [parsed.config.plate]
+            : [];
+        const selectedPlate =
+            plateNodes.find((plate: any) => {
+                const metadata = Array.isArray(plate?.metadata)
+                    ? plate.metadata
+                    : plate?.metadata
+                        ? [plate.metadata]
+                        : [];
+                return metadata.some((item: any) => item?.key === 'index' && Number(item?.value) === plateNumber);
+            }) || plateNodes[plateIndex] || plateNodes[0];
+
+        const filamentNodes = selectedPlate?.filament
+            ? Array.isArray(selectedPlate.filament) ? selectedPlate.filament : [selectedPlate.filament]
+            : [];
+        for (const filament of filamentNodes) {
+            const id = Number.parseInt(String(filament?.id ?? ''), 10);
+            if (!Number.isFinite(id)) continue;
+            filamentById.set(id, {
+                tray_info_idx: typeof filament?.tray_info_idx === 'string' ? filament.tray_info_idx : null,
+                type: typeof filament?.type === 'string' ? filament.type : null,
+                color: typeof filament?.color === 'string' ? filament.color : null,
+            });
+        }
+    }
+
+    return {
+        plateIndex,
+        usedFilamentPositions,
+        filaments: usedFilamentPositions.map((position: number, order: number) => {
+            const filamentId = position + 1;
+            const byOneBasedId = filamentById.get(filamentId);
+            const byOrder = Array.from(filamentById.values())[order];
+            const filament = byOneBasedId || byOrder || null;
+            return {
+                filamentPosition: position,
+                filamentId,
+                tray_info_idx: filament?.tray_info_idx ?? null,
+                type: filament?.type ?? null,
+                color: filament?.color ?? null,
+            };
+        }),
     };
 }

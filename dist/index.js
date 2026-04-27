@@ -9,7 +9,7 @@ import path from "path";
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { STLManipulator } from "./stl/stl-manipulator.js";
-import { analyzeCollarCharm3MF, extractBambuTemplateSettings, getCollarCharmRolePolicy, parse3MF } from './3mf_parser.js';
+import { analyze3MFAmsRequirements, analyzeCollarCharm3MF, extractBambuTemplateSettings, getCollarCharmRolePolicy, parse3MF } from './3mf_parser.js';
 import { BambuImplementation } from "./printers/bambu.js";
 dotenv.config();
 const DEFAULT_HOST = process.env.BAMBU_PRINTER_HOST || process.env.PRINTER_HOST || "localhost";
@@ -166,6 +166,37 @@ function normalizePrinterFilamentInventory(status, bambuModel, nozzleDiameter) {
             : null,
         load_filaments_all: allProfilePaths.length > 0 ? allProfilePaths.join(";") : null,
     };
+}
+function resolveAmsSlotsFromRequirements(requirements, inventory) {
+    const matches = [];
+    const missing = [];
+    const amsSlots = [];
+    for (const filament of requirements.filaments) {
+        if (!filament.tray_info_idx) {
+            missing.push({
+                filament_position: filament.filamentPosition,
+                tray_info_idx: null,
+            });
+            continue;
+        }
+        const tray = inventory.trays.find((candidate) => candidate.loaded &&
+            candidate.slot !== null &&
+            candidate.tray_info_idx === filament.tray_info_idx);
+        if (!tray || tray.slot === null) {
+            missing.push({
+                filament_position: filament.filamentPosition,
+                tray_info_idx: filament.tray_info_idx,
+            });
+            continue;
+        }
+        amsSlots.push(tray.slot);
+        matches.push({
+            filament_position: filament.filamentPosition,
+            tray_info_idx: filament.tray_info_idx,
+            slot: tray.slot,
+        });
+    }
+    return { ams_slots: amsSlots, matches, missing };
 }
 function validateBambuModel(model) {
     const normalized = model.trim().toLowerCase();
@@ -709,6 +740,27 @@ class BambuPrinterMCPServer {
                         }
                     },
                     {
+                        name: "resolve_3mf_ams_slots",
+                        description: "Inspect a sliced 3MF and match its tray_info_idx filament requirements against the live AMS inventory. Does not upload or start a print.",
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                three_mf_path: { type: "string", description: "Path to a sliced 3MF/.gcode.3mf file" },
+                                plate_index: { type: "number", description: "0-based plate index to inspect (default: 0)" },
+                                bambu_model: {
+                                    type: "string",
+                                    enum: ["p1s", "p1p", "x1c", "x1e", "a1", "a1mini", "h2d", "h2s"],
+                                    description: "Optional model hint used to resolve Bambu/Orca filament profile JSONs for each tray."
+                                },
+                                nozzle_diameter: { type: "string", description: "Nozzle diameter in mm (default: 0.4)" },
+                                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+                            },
+                            required: ["three_mf_path"]
+                        }
+                    },
+                    {
                         name: "extend_stl_base",
                         description: "Extend the base of an STL file by a specified amount",
                         inputSchema: {
@@ -1044,6 +1096,10 @@ class BambuPrinterMCPServer {
                                     description: "Preferred AMS input: one absolute tray index per USED filament in plate order, e.g. [1] for a single-filament print pulling from AMS 0 slot 1. Expanded to project-level ams_mapping automatically from the 3MF's plate_N.json and gcode header.",
                                     items: { type: "number" }
                                 },
+                                auto_match_ams: {
+                                    type: "boolean",
+                                    description: "When true, match the sliced 3MF's tray_info_idx requirements against live AMS inventory and use the resulting ams_slots. Ignored when ams_mapping or ams_slots is provided."
+                                },
                                 bed_leveling: { type: "boolean", description: "Enable auto bed leveling (default: true)" },
                                 flow_calibration: { type: "boolean", description: "Enable flow calibration (default: true)" },
                                 vibration_calibration: { type: "boolean", description: "Enable vibration calibration (default: true)" },
@@ -1171,6 +1227,25 @@ class BambuPrinterMCPServer {
                         const normalizedModel = requestedModel ? validateBambuModel(requestedModel) : undefined;
                         const nozzleDiam = String(args?.nozzle_diameter || DEFAULT_NOZZLE_DIAMETER);
                         result = await this.getResolvedPrinterFilamentInventory(host, bambuSerial, bambuToken, normalizedModel, nozzleDiam);
+                        break;
+                    }
+                    case "resolve_3mf_ams_slots": {
+                        if (!args?.three_mf_path) {
+                            throw new Error("Missing required parameter: three_mf_path");
+                        }
+                        const requestedModel = (String(args?.bambu_model ?? DEFAULT_BAMBU_MODEL ?? "")).trim().toLowerCase();
+                        const normalizedModel = requestedModel ? validateBambuModel(requestedModel) : undefined;
+                        const nozzleDiam = String(args?.nozzle_diameter || DEFAULT_NOZZLE_DIAMETER);
+                        const requirements = await analyze3MFAmsRequirements(String(args.three_mf_path), args?.plate_index !== undefined ? Number(args.plate_index) : 0);
+                        const inventory = await this.getResolvedPrinterFilamentInventory(host, bambuSerial, bambuToken, normalizedModel, nozzleDiam);
+                        const resolved = resolveAmsSlotsFromRequirements(requirements, inventory);
+                        result = {
+                            status: resolved.missing.length === 0 ? "matched" : "missing",
+                            requirements,
+                            ams_slots: resolved.ams_slots,
+                            matches: resolved.matches,
+                            missing: resolved.missing,
+                        };
                         break;
                     }
                     case "list_templates":
@@ -1451,13 +1526,16 @@ class BambuPrinterMCPServer {
                             }
                         }
                         let finalAmsMapping = parsedAmsMapping;
+                        let finalAmsSlots;
                         let useAMS = args?.use_ams !== undefined ? Boolean(args.use_ams) : (!!finalAmsMapping && finalAmsMapping.length > 0);
-                        if (args?.ams_mapping) {
+                        const hasUserAmsMapping = Boolean(args?.ams_mapping);
+                        const hasUserAmsSlots = Array.isArray(args?.ams_slots);
+                        if (hasUserAmsMapping) {
                             let userMappingOverride;
                             if (Array.isArray(args.ams_mapping)) {
                                 userMappingOverride = args.ams_mapping.filter((v) => typeof v === 'number');
                             }
-                            else if (typeof args.ams_mapping === 'object') {
+                            else if (args.ams_mapping && typeof args.ams_mapping === 'object') {
                                 userMappingOverride = Object.values(args.ams_mapping)
                                     .filter((v) => typeof v === 'number')
                                     .sort((a, b) => a - b);
@@ -1467,11 +1545,33 @@ class BambuPrinterMCPServer {
                                 useAMS = true;
                             }
                         }
+                        if (hasUserAmsSlots) {
+                            const userSlots = args.ams_slots.filter((v) => typeof v === 'number');
+                            if (userSlots.length > 0) {
+                                finalAmsSlots = userSlots;
+                                finalAmsMapping = undefined;
+                                useAMS = true;
+                            }
+                        }
+                        if (!hasUserAmsMapping && !hasUserAmsSlots && args?.auto_match_ams === true && args?.use_ams !== false) {
+                            const requirements = await analyze3MFAmsRequirements(threeMFPath, 0);
+                            const inventory = await this.getResolvedPrinterFilamentInventory(host, bambuSerial, bambuToken, printModel, printNozzle);
+                            const resolved = resolveAmsSlotsFromRequirements(requirements, inventory);
+                            if (resolved.missing.length > 0) {
+                                throw new Error(`auto_match_ams could not find loaded AMS trays for: ${resolved.missing
+                                    .map((missing) => missing.tray_info_idx || `filament position ${missing.filament_position}`)
+                                    .join(", ")}`);
+                            }
+                            finalAmsMapping = undefined;
+                            finalAmsSlots = resolved.ams_slots;
+                            useAMS = finalAmsSlots.length > 0;
+                        }
                         if (args?.use_ams === false) {
                             finalAmsMapping = undefined;
+                            finalAmsSlots = undefined;
                             useAMS = false;
                         }
-                        if (!finalAmsMapping || finalAmsMapping.length === 0) {
+                        if ((!finalAmsMapping || finalAmsMapping.length === 0) && (!finalAmsSlots || finalAmsSlots.length === 0)) {
                             useAMS = false;
                         }
                         const threeMfFilename = path.basename(threeMFPath);
@@ -1482,6 +1582,7 @@ class BambuPrinterMCPServer {
                             plateIndex: 0,
                             useAMS: useAMS,
                             amsMapping: finalAmsMapping,
+                            amsSlots: finalAmsSlots,
                             bedType: printBedType,
                             bedLeveling: args?.bed_leveling !== undefined ? Boolean(args.bed_leveling) : undefined,
                             flowCalibration: args?.flow_calibration !== undefined ? Boolean(args.flow_calibration) : undefined,

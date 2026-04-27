@@ -13,7 +13,7 @@
     "start:stdio": "MCP_TRANSPORT=stdio node dist/index.js",
     "start:http": "MCP_TRANSPORT=streamable-http node dist/index.js",
     "build": "tsc",
-    "test": "npm run build && node --test tests/**/*.test.mjs"
+    "test": "npm run build && node --test tests/*.test.mjs tests/**/*.test.mjs"
   },
   "bin": {
     "bambu-printer-mcp": "dist/index.js"

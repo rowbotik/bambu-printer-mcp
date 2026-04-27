@@ -12,7 +12,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import JSZip from "jszip";
-import { analyzeCollarCharm3MF } from "../dist/3mf_parser.js";
+import { analyze3MFAmsRequirements, analyzeCollarCharm3MF } from "../dist/3mf_parser.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -82,6 +82,7 @@ function parseJsonResult(toolResult) {
 function assertCommonToolPresence(listToolsResult) {
   const names = listToolsResult.tools.map((tool) => tool.name);
   assert.ok(names.includes("get_printer_status"));
+  assert.ok(names.includes("resolve_3mf_ams_slots"));
   assert.ok(names.includes("get_stl_info"));
   assert.ok(names.includes("blender_mcp_edit_model"));
   assert.ok(names.includes("print_3mf"), "print_3mf tool must be registered");
@@ -150,6 +151,10 @@ test("printer model safety: schema requires bambu_model, rejects missing/invalid
   assert.ok(
     print3mfTool.inputSchema.properties.ams_mapping,
     "print_3mf must have ams_mapping property"
+  );
+  assert.ok(
+    print3mfTool.inputSchema.properties.auto_match_ams,
+    "print_3mf must have auto_match_ams property"
   );
   assert.ok(
     print3mfTool.inputSchema.properties.bambu_model,
@@ -239,6 +244,31 @@ test("printer model safety: schema requires bambu_model, rejects missing/invalid
     !validModelError.includes("bambu_model"),
     `Error with valid model should not be about model, got: ${validModelError}`
   );
+});
+
+test("3MF AMS requirement analysis maps plate filament_ids to slice_info tray_info_idx", async () => {
+  const fixture = path.join(REPO_ROOT, "tests/fixtures/h2d_gui_sliced");
+  const zip = new JSZip();
+  zip.file("Metadata/plate_1.json", fs.readFileSync(path.join(fixture, "plate_1.json"), "utf8"));
+  zip.file("Metadata/slice_info.config", fs.readFileSync(path.join(fixture, "slice_info.config"), "utf8"));
+  const tempPath = path.join(os.tmpdir(), `ams-requirements-${Date.now()}.3mf`);
+  fs.writeFileSync(tempPath, await zip.generateAsync({ type: "nodebuffer" }));
+
+  try {
+    const requirements = await analyze3MFAmsRequirements(tempPath, 0);
+    assert.deepEqual(requirements.usedFilamentPositions, [4]);
+    assert.deepEqual(requirements.filaments, [
+      {
+        filamentPosition: 4,
+        filamentId: 5,
+        tray_info_idx: "GFG02",
+        type: "PETG",
+        color: "#FFFFFF",
+      },
+    ]);
+  } finally {
+    fs.rmSync(tempPath, { force: true });
+  }
 });
 
 test("printer model safety: BAMBU_MODEL env var accepted as default", async (t) => {

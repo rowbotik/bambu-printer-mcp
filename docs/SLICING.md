@@ -131,6 +131,14 @@ The MCP reads `Metadata/plate_<n>.json.filament_ids` plus the
 project-level filament should pull from. You no longer need to hand-compute
 `[-1, 1, -1, -1]`.
 
+For a dry run, call `resolve_3mf_ams_slots` on the sliced 3MF. It reads
+`Metadata/slice_info.config` for each required `tray_info_idx` and compares
+those RFID-style filament ids against the live AMS inventory. If all required
+filaments are loaded, it returns the `ams_slots` array that `print_3mf` will
+accept. For printing, pass `auto_match_ams: true` to let `print_3mf` apply the
+same match automatically; explicit `ams_slots` or `ams_mapping` still take
+precedence.
+
 ## Quick troubleshooting
 
 | Symptom | Likely cause | Fix |

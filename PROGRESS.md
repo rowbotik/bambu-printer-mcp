@@ -15,6 +15,7 @@ Branch: `codex/collar-charm-h2-cleanup`. Committed as `235f224`
 | CLI smoke X1C | ✅ printable plate gcode (111,415 bytes) |
 | CLI smoke P1S | ✅ printable plate gcode (111,313 bytes) |
 | MCP `slice_stl` smoke | ✅ H2S via stdio with `BAMBU_CLI_FLATTEN=true` |
+| AMS RFID auto-match | ✅ dry-run tool + opt-in `print_3mf` path; not live-print verified |
 | End-to-end on real printer | ⏳ not yet run |
 | Upstream bug report | ⏳ drafted, not posted |
 
@@ -26,6 +27,12 @@ Post-commit verification rerun on 2026-04-26:
   `temp/sample_cube_sliced.3mf`; verified it contains
   `Metadata/plate_1.gcode` (110,970 bytes), `project_settings.config`, and
   `slice_info.config`.
+
+Follow-up verification:
+
+- `npm test` now runs both root and nested test files and passed 18/18.
+- Added parser coverage proving H2D `plate_1.json.filament_ids` maps to
+  `slice_info.config` `tray_info_idx` (`GFG02` in the fixture).
 
 ## What's done
 
@@ -184,10 +191,9 @@ feat: BambuStudio CLI auto-flatten + pause/resume tools
 ### Bambuddy-inspired features (per user prioritization)
 
 - **MUST HAVE:** ✅ pause / resume — done.
-- **VERY MUCH WANT:** AMS auto-match by RFID. Joins
-  `plate_<n>.json.filament_ids` against live `ams.tray.tray_info_idx`
-  (e.g. `GFG02`) from `push_status`. Removes the last manual step from
-  `print_3mf`. Estimated half a day.
+- **VERY MUCH WANT:** ✅ AMS auto-match by RFID — implemented as
+  `resolve_3mf_ams_slots` dry run plus opt-in `print_3mf auto_match_ams`.
+  Still needs live H2S/H2D print validation before calling it production-safe.
 - **Future versions:** AMS RFID re-read tool, skip objects mid-print,
   chamber light/fan/airduct control, AMS dryer start/stop, HMS error
   resource (`printer://{host}/hms`).

@@ -800,7 +800,23 @@ The primary tool for starting a Bambu print. **Recommended input: a pre-sliced `
 
 `bed_type` defaults to `textured_plate` if omitted. `ams_slots` is the preferred override input; `ams_mapping` remains the raw escape hatch. On AMS-equipped printers, `use_ams: false` does not suppress mapping lookup if the sliced file declares filaments.
 
+Set `auto_match_ams: true` to match the sliced 3MF's `tray_info_idx` values against the live AMS inventory and use the matching `ams_slots`. This is ignored when you provide `ams_slots` or `ams_mapping` explicitly.
+
 Layer height, nozzle temperature, and other slicer parameters cannot be overridden via this tool -- they are baked into the 3MF's G-code at slice time. Apply those settings in your slicer before generating the 3MF.
+
+#### resolve_3mf_ams_slots
+
+Dry-run the AMS match without uploading or starting a print. The tool reads `Metadata/plate_<n>.json` and `Metadata/slice_info.config`, then compares required `tray_info_idx` values against live AMS trays.
+
+```json
+{
+  "three_mf_path": "/Users/yourname/Downloads/bracket.gcode.3mf",
+  "bambu_model": "h2d",
+  "host": "192.168.1.100",
+  "bambu_serial": "094...",
+  "bambu_token": "your_access_token"
+}
+```
 
 #### print_collar_charm
 

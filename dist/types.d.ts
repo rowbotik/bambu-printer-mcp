@@ -68,3 +68,15 @@ export interface CollarCharmAnalysis {
     amsSlots: number[];
     roles: CollarCharmRole[];
 }
+export interface ThreeMFFilamentRequirement {
+    filamentPosition: number;
+    filamentId: number;
+    tray_info_idx: string | null;
+    type: string | null;
+    color: string | null;
+}
+export interface ThreeMFAmsRequirements {
+    plateIndex: number;
+    usedFilamentPositions: number[];
+    filaments: ThreeMFFilamentRequirement[];
+}
