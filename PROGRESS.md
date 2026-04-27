@@ -1,7 +1,8 @@
 # Progress
 
 Working state for the BambuStudio CLI auto-flatten + control-tool work.
-Branch: `codex/collar-charm-h2-cleanup`. Nothing committed yet.
+Branch: `codex/collar-charm-h2-cleanup`. Committed as `235f224`
+(`feat: BambuStudio CLI auto-flatten + pause/resume tools`); not pushed yet.
 
 ## Status snapshot (2026-04-26)
 
@@ -13,8 +14,18 @@ Branch: `codex/collar-charm-h2-cleanup`. Nothing committed yet.
 | CLI smoke H2D | ✅ printable plate gcode (116,704 bytes) |
 | CLI smoke X1C | ✅ printable plate gcode (111,415 bytes) |
 | CLI smoke P1S | ✅ printable plate gcode (111,313 bytes) |
+| MCP `slice_stl` smoke | ✅ H2S via stdio with `BAMBU_CLI_FLATTEN=true` |
 | End-to-end on real printer | ⏳ not yet run |
 | Upstream bug report | ⏳ drafted, not posted |
+
+Post-commit verification rerun on 2026-04-26:
+
+- `npm test` passed (`npm run build` + 9/9 flattener tests).
+- `scripts/test-cli-slice.mjs` passed for `h2s`, `h2d`, `x1c`, and `p1s`.
+- Direct MCP stdio `slice_stl` call with `BAMBU_CLI_FLATTEN=true` returned
+  `temp/sample_cube_sliced.3mf`; verified it contains
+  `Metadata/plate_1.gcode` (110,970 bytes), `project_settings.config`, and
+  `slice_info.config`.
 
 ## What's done
 
@@ -160,10 +171,9 @@ feat: BambuStudio CLI auto-flatten + pause/resume tools
 
 ### High priority
 
-- **End-to-end test through the actual MCP tool surface.** Spin up the
-  server, call `slice_stl` with `BAMBU_CLI_FLATTEN=true`, then `print_3mf`
-  with the result, against the H2S/H2D. The standalone smoke covers the
-  same code path but doesn't exercise the MCP framing.
+- **End-to-end test through the actual MCP tool surface.** `slice_stl` via
+  MCP stdio is verified with `BAMBU_CLI_FLATTEN=true`; still need a live
+  `print_3mf` run against H2S/H2D when it is safe to start a physical print.
 - **Post upstream comment on bambulab/BambuStudio#9636.** Dossier drafted
   in conversation; needs polish + posting. Includes:
   - Root-cause walkthrough with line numbers from `BambuStudio.cpp`.
