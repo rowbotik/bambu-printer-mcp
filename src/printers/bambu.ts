@@ -12,6 +12,8 @@ import {
   GCodeFileCommand,
   GCodeLineCommand,
   PushAllCommand,
+  UpdateFanCommand,
+  UpdateLightCommand,
   UpdateStateCommand,
 } from "bambu-node";
 
@@ -816,6 +818,79 @@ export class BambuImplementation {
       status: "success",
       message: `Temperature command sent for ${normalizedComponent}.`,
       command: gcode,
+    };
+  }
+
+  async setFanSpeed(
+    host: string,
+    serial: string,
+    token: string,
+    fan: string | number,
+    speed: number
+  ) {
+    const printer = await this.getPrinter(host, serial, token);
+    const normalizedFan = typeof fan === "number" ? fan : fan.trim().toLowerCase();
+    const fanId =
+      normalizedFan === 1 || normalizedFan === "1" || normalizedFan === "part" || normalizedFan === "part_cooling"
+        ? 1
+        : normalizedFan === 2 || normalizedFan === "2" || normalizedFan === "aux" || normalizedFan === "auxiliary"
+          ? 2
+          : normalizedFan === 3 || normalizedFan === "3" || normalizedFan === "chamber"
+            ? 3
+            : null;
+
+    if (fanId === null) {
+      throw new Error("Unsupported fan. Use one of: part, auxiliary, chamber, 1, 2, 3.");
+    }
+
+    const targetSpeed = Math.round(speed);
+    if (targetSpeed < 0 || targetSpeed > 100) {
+      throw new Error("Fan speed must be between 0 and 100 percent.");
+    }
+
+    await invokeWithoutAck(
+      printer,
+      new UpdateFanCommand({ fan: fanId as any, speed: targetSpeed as any })
+    );
+    return {
+      status: "success",
+      message: `Fan speed command sent for fan ${fanId}.`,
+      fan: fanId,
+      speed: targetSpeed,
+    };
+  }
+
+  async setLight(
+    host: string,
+    serial: string,
+    token: string,
+    light: string,
+    mode: string
+  ) {
+    const printer = await this.getPrinter(host, serial, token);
+    const normalizedLight = light.trim();
+    const normalizedMode = mode.trim().toLowerCase();
+    const validModes = new Set(["on", "off", "flashing"]);
+
+    if (!normalizedLight) {
+      throw new Error("Light node is required, for example: chamber_light.");
+    }
+    if (!validModes.has(normalizedMode)) {
+      throw new Error("Light mode must be one of: on, off, flashing.");
+    }
+
+    await invokeWithoutAck(
+      printer,
+      new UpdateLightCommand({
+        light: normalizedLight as any,
+        mode: normalizedMode as any,
+      })
+    );
+    return {
+      status: "success",
+      message: `Light command sent for ${normalizedLight}.`,
+      light: normalizedLight,
+      mode: normalizedMode,
     };
   }
 

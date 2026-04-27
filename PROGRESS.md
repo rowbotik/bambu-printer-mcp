@@ -17,6 +17,7 @@ Branch: `codex/collar-charm-h2-cleanup`. Committed as `235f224`
 | MCP `slice_stl` smoke | ✅ H2S via stdio with `BAMBU_CLI_FLATTEN=true` |
 | AMS RFID auto-match | ✅ dry-run tool + opt-in `print_3mf` path; not live-print verified |
 | HMS diagnostics resource | ✅ `printer://{host}/hms` read-only status summary |
+| Light/fan controls | ✅ `set_light` and `set_fan_speed` wrappers; not live-device verified |
 | End-to-end on real printer | ⏳ not yet run |
 | Upstream bug report | ⏳ drafted, not posted |
 
@@ -196,9 +197,12 @@ feat: BambuStudio CLI auto-flatten + pause/resume tools
   `resolve_3mf_ams_slots` dry run plus opt-in `print_3mf auto_match_ams`.
   Still needs live H2S/H2D print validation before calling it production-safe.
 - **Future versions:** AMS RFID re-read tool, skip objects mid-print,
-  chamber light/fan/airduct control, AMS dryer start/stop.
+  airduct control, AMS dryer start/stop.
 - **HMS error resource:** ✅ `printer://{host}/hms` is implemented as a
   read-only diagnostics summary over the existing status path.
+- **Light/fan control:** ✅ `set_light` and `set_fan_speed` are implemented
+  through the existing `bambu-node` MQTT commands. They still need live-device
+  validation.
 
 ## How to verify
 

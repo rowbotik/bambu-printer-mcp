@@ -768,6 +768,34 @@ Set the target temperature for the bed or nozzle. Dispatches an M140 (bed) or M1
 }
 ```
 
+#### set_fan_speed
+
+Set a printer fan speed from 0 to 100 percent. Accepted `fan` values are `part`, `auxiliary`, `chamber`, `1`, `2`, and `3`.
+
+```json
+{
+  "fan": "chamber",
+  "speed": 40,
+  "host": "192.168.1.100",
+  "bambu_serial": "01P00A123456789",
+  "bambu_token": "your_access_token"
+}
+```
+
+#### set_light
+
+Set a printer light node mode. Common Bambu firmware reports the chamber light as `chamber_light`; valid modes are `on`, `off`, and `flashing`.
+
+```json
+{
+  "light": "chamber_light",
+  "mode": "on",
+  "host": "192.168.1.100",
+  "bambu_serial": "01P00A123456789",
+  "bambu_token": "your_access_token"
+}
+```
+
 #### print_3mf
 
 The primary tool for starting a Bambu print. **Recommended input: a pre-sliced `.gcode.3mf` exported from Bambu Studio** — see [docs/SLICING.md](./docs/SLICING.md). This tool handles the complete workflow:
@@ -1048,6 +1076,8 @@ After connecting the MCP server in Claude Desktop or Claude Code, you can ask Cl
 - "Cancel the current print job."
 - "Set the nozzle temperature to 220 degrees."
 - "Set the bed to 65 degrees."
+- "Turn the chamber light on."
+- "Set the chamber fan to 40 percent."
 
 ### Printing 3MF files
 

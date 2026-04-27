@@ -36,6 +36,18 @@ export declare class BambuImplementation {
         message: string;
         command: string;
     }>;
+    setFanSpeed(host: string, serial: string, token: string, fan: string | number, speed: number): Promise<{
+        status: string;
+        message: string;
+        fan: number;
+        speed: number;
+    }>;
+    setLight(host: string, serial: string, token: string, light: string, mode: string): Promise<{
+        status: string;
+        message: string;
+        light: string;
+        mode: string;
+    }>;
     getFiles(host: string, serial: string, token: string): Promise<{
         files: string[];
         directories: Record<string, string[]>;

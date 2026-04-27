@@ -83,6 +83,8 @@ function assertCommonToolPresence(listToolsResult) {
   const names = listToolsResult.tools.map((tool) => tool.name);
   assert.ok(names.includes("get_printer_status"));
   assert.ok(names.includes("resolve_3mf_ams_slots"));
+  assert.ok(names.includes("set_fan_speed"));
+  assert.ok(names.includes("set_light"));
   assert.ok(names.includes("get_stl_info"));
   assert.ok(names.includes("blender_mcp_edit_model"));
   assert.ok(names.includes("print_3mf"), "print_3mf tool must be registered");

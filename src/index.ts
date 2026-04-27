@@ -1381,6 +1381,46 @@ class BambuPrinterMCPServer {
             }
           },
           {
+            name: "set_fan_speed",
+            description: "Set a Bambu printer fan speed percentage using the printer's MQTT fan command",
+            inputSchema: {
+              type: "object",
+              properties: {
+                fan: {
+                  type: "string",
+                  description: "Fan to control: part, auxiliary, chamber, 1, 2, or 3"
+                },
+                speed: { type: "number", description: "Fan speed percentage from 0 to 100" },
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              },
+              required: ["fan", "speed"]
+            }
+          },
+          {
+            name: "set_light",
+            description: "Set a Bambu printer light node mode using the printer's MQTT LED command",
+            inputSchema: {
+              type: "object",
+              properties: {
+                light: {
+                  type: "string",
+                  description: "Light node to control, for example chamber_light"
+                },
+                mode: {
+                  type: "string",
+                  enum: ["on", "off", "flashing"],
+                  description: "Light mode to apply"
+                },
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              },
+              required: ["light", "mode"]
+            }
+          },
+          {
             name: "print_3mf",
             description: "Print a 3MF file on a Bambu Lab printer. Auto-slices if the 3MF has no gcode. IMPORTANT: bambu_model must be specified to ensure safe printer operation.",
             inputSchema: {
@@ -1659,6 +1699,32 @@ class BambuPrinterMCPServer {
             result = await this.bambu.setTemperature(
               host, bambuSerial, bambuToken,
               String(args.component), Number(args.temperature)
+            );
+            break;
+
+          case "set_fan_speed":
+            if (!args?.fan || args?.speed === undefined) {
+              throw new Error("Missing required parameters: fan and speed");
+            }
+            result = await this.bambu.setFanSpeed(
+              host,
+              bambuSerial,
+              bambuToken,
+              String(args.fan),
+              Number(args.speed)
+            );
+            break;
+
+          case "set_light":
+            if (!args?.light || !args?.mode) {
+              throw new Error("Missing required parameters: light and mode");
+            }
+            result = await this.bambu.setLight(
+              host,
+              bambuSerial,
+              bambuToken,
+              String(args.light),
+              String(args.mode)
             );
             break;
 
