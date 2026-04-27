@@ -518,25 +518,36 @@ test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", asyn
   }
 });
 
-test("camera_snapshot fails fast for H2 series (undocumented protocol)", async () => {
+test("camera_snapshot routes H2 series through RTSP (verified live on Parker H2S)", async () => {
   const bambu = new BambuImplementation();
-  for (const model of ["h2", "h2s", "h2d"]) {
-    await assert.rejects(
-      bambu.cameraSnapshot("127.0.0.1", "S", "T", { bambuModel: model }),
-      /not documented upstream/i,
-      `expected undocumented-protocol error for ${model}`
-    );
+  const fakeJpeg = Buffer.from([0xff, 0xd8, 0x12, 0x34, 0xff, 0xd9]);
+  let rtspCalls = 0;
+  let tcpCalls = 0;
+  bambu.fetchRtspCameraFrame = async () => { rtspCalls++; return fakeJpeg; };
+  bambu.fetchTcpCameraFrame = async () => { tcpCalls++; return fakeJpeg; };
+
+  for (const model of ["h2", "h2s", "h2d", "h2c", "h2dpro"]) {
+    const out = await bambu.cameraSnapshot("127.0.0.1", "S", "T", { bambuModel: model });
+    assert.equal(out.status, "success", `${model} should succeed via RTSP`);
+    assert.equal(out.transport, "rtsps-322", `${model} transport should be rtsps-322`);
   }
+  assert.equal(rtspCalls, 5, "RTSP path should run once per H2 variant");
+  assert.equal(tcpCalls, 0, "TCP-on-6000 path should not run for H2");
 });
 
-test("camera_snapshot fails fast for X1/P2S series (RTSP not implemented)", async () => {
+test("camera_snapshot routes X1/P2S through RTSP", async () => {
   const bambu = new BambuImplementation();
-  for (const model of ["x1", "x1c", "x1e", "p2s"]) {
-    await assert.rejects(
-      bambu.cameraSnapshot("127.0.0.1", "S", "T", { bambuModel: model }),
-      /RTSP on port 322 which is not yet implemented/i,
-      `expected RTSP-not-implemented error for ${model}`
-    );
+  const fakeJpeg = Buffer.from([0xff, 0xd8, 0xab, 0xcd, 0xff, 0xd9]);
+  bambu.fetchRtspCameraFrame = async () => fakeJpeg;
+  bambu.fetchTcpCameraFrame = async () => {
+    throw new Error("RTSP models must not reach the TCP wire path");
+  };
+
+  for (const model of ["x1", "x1c", "x1carbon", "x1e", "p2s"]) {
+    const out = await bambu.cameraSnapshot("127.0.0.1", "S", "T", { bambuModel: model });
+    assert.equal(out.transport, "rtsps-322", `${model} should use rtsps-322`);
+    assert.equal(out.format, "image/jpeg");
+    assert.deepEqual(Buffer.from(out.base64, "base64"), fakeJpeg);
   }
 });
 
@@ -565,47 +576,17 @@ test("camera_snapshot supported models reach the wire path (mocked) and decode a
   }
 });
 
-test("camera_snapshot experimental:true bypasses H2 fail-fast and reaches the wire path", async () => {
+test("camera_snapshot RTSP path: ffmpeg ENOENT yields a clear, actionable error", async () => {
   const bambu = new BambuImplementation();
-  const fakeJpeg = Buffer.from([0xff, 0xd8, 0x99, 0x88, 0xff, 0xd9]);
-  let wireCalled = 0;
-  bambu.fetchTcpCameraFrame = async () => {
-    wireCalled += 1;
-    return fakeJpeg;
-  };
-
-  for (const model of ["h2", "h2s", "h2d"]) {
-    const out = await bambu.cameraSnapshot("127.0.0.1", "S", "T", {
-      bambuModel: model,
-      experimental: true,
-    });
-    assert.equal(out.status, "success", `${model} experimental should reach wire path`);
-    assert.equal(out.sizeBytes, fakeJpeg.length);
-    assert.match(
-      out.note,
-      /experimental:true/i,
-      `${model} response should carry an experimental note`
-    );
-  }
-  assert.equal(wireCalled, 3, "wire path should run once per H2 variant");
-});
-
-test("camera_snapshot experimental:true does NOT bypass the X1/P2S RTSP error", async () => {
-  const bambu = new BambuImplementation();
-  bambu.fetchTcpCameraFrame = async () => {
-    throw new Error("RTSP models must not reach the TCP wire path");
-  };
-
-  for (const model of ["x1", "x1c", "x1e", "p2s"]) {
-    await assert.rejects(
-      bambu.cameraSnapshot("127.0.0.1", "S", "T", {
-        bambuModel: model,
-        experimental: true,
-      }),
-      /RTSP on port 322 which is not yet implemented/i,
-      `${model} should still fail; experimental flag is H2-only for now`
-    );
-  }
+  // Don't mock fetchRtspCameraFrame -- exercise it with a bogus binary
+  // path and confirm the surfacing.
+  await assert.rejects(
+    bambu.cameraSnapshot("127.0.0.1", "S", "T", {
+      bambuModel: "h2s",
+      ffmpegPath: "/no/such/ffmpeg-binary",
+    }),
+    /ffmpeg binary not found.*brew install ffmpeg/i
+  );
 });
 
 test("camera_snapshot save_path writes the jpeg to disk", async (t) => {

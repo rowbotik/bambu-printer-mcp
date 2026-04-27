@@ -38,7 +38,36 @@ wire format on a printer we can't easily test against. Future work:
 either reverse-engineer the H2 protocol from a packet capture or wait
 for upstream docs.
 
-### H2 probe results (2026-04-27, against Parker H2S `192.168.68.93`)
+### H2 camera RESOLVED via RTSP (2026-04-27)
+
+Live test against Parker (H2S, `192.168.68.93`): RTSP works.
+
+```
+sizeBytes: 125,321
+JPEG SOI: true
+transport: rtsps-322
+saved to: /tmp/parker-probe.jpg (real chamber image)
+roundtrip: ~1.5s
+```
+
+**Root cause of the earlier H2 failure:** the H2 series doesn't speak
+the A1/P1 TCP-on-6000 protocol at all -- it uses RTSP, same as X1.
+The OpenBambuAPI `video.md` doc just doesn't list H2. Confirmed by
+reading HA bambulab's `models.py` Camera class, which derives
+`rtsp_url` from the printer's own MQTT `ipcam` push, and by the live
+probe.
+
+**Fix shipped:** `cameraSnapshot` now routes X1/X1C/X1E/P2S AND
+H2/H2S/H2D/H2C/H2D Pro through a new `fetchRtspCameraFrame()` that
+shells out to ffmpeg with `rtsps://bblp:<token>@<host>:322/streaming/live/1
+-frames:v 1`. The TCP-on-6000 path remains for A1/P1 series.
+
+`experimental: true` on the tool schema is now a no-op; it stayed
+on the type/schema for backward compat but the description marks it
+deprecated. The fail-fast for unverified models still applies for
+truly unknown strings.
+
+### H2 probe results (2026-04-27, against Parker H2S `192.168.68.93`) -- historical
 
 Fired `camera_snapshot` with `experimental:true` against Parker, then
 the raw-byte probe (`scripts/probe-h2-raw.mjs`) for diagnostic data.

@@ -103,14 +103,18 @@ export declare class BambuImplementation {
         timeoutMs?: number;
         bambuModel?: string;
         /**
-         * Opt-in: try the TCP-on-6000 path for hardware whose camera
-         * protocol isn't documented upstream (currently H2 series). The
-         * A1/P1 wire format may or may not work; if it does, we get a
-         * JPEG. If not, the connection fails or the auth handshake is
-         * rejected and the caller gets a clean error. No data is
-         * exfiltrated either way -- read-only.
+         * Reserved. Earlier this flag let callers probe the H2 series via
+         * the A1/P1 TCP-on-6000 path. Diagnostics confirmed the printer
+         * does not speak that protocol; H2 uses RTSP, same as X1. The
+         * flag is now ignored. Kept on the type to avoid breaking
+         * existing callers.
          */
         experimental?: boolean;
+        /**
+         * Optional override for the ffmpeg binary path used by the RTSP
+         * path. Defaults to `ffmpeg` (relies on $PATH).
+         */
+        ffmpegPath?: string;
     }): Promise<{
         status: string;
         format: string;
@@ -120,7 +124,24 @@ export declare class BambuImplementation {
         width?: number;
         height?: number;
         note?: string;
+        transport?: "tcp-6000" | "rtsps-322";
     }>;
+    /**
+     * Pull a single JPEG frame from the printer's RTSP/RTSPS stream using
+     * ffmpeg. Used for X1, P2S, and H2 series.
+     *
+     * URL pattern verified against HA bambulab's models.py example:
+     *   rtsps://bblp:<access_code>@<host>:322/streaming/live/1
+     *
+     * ffmpeg invocation:
+     *   ffmpeg -rtsp_transport tcp -i <url> -frames:v 1 -f image2 -c:v mjpeg -y <out>
+     *
+     * -rtsp_transport tcp avoids UDP NAT/firewall issues. -frames:v 1
+     * makes ffmpeg exit as soon as one frame lands. -y overwrites the temp
+     * file. The Bambu printer presents a self-signed cert; ffmpeg's TLS
+     * layer accepts that by default (no host verification).
+     */
+    private fetchRtspCameraFrame;
     /**
      * Open the TLS-on-6000 socket, send the 80-byte auth packet, and read
      * a single complete JPEG frame. Returns the JPEG bytes.

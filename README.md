@@ -69,7 +69,7 @@ Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the c
 - Get detailed printer status: temperatures (nozzle, bed, chamber), print progress, current layer, time remaining, and live AMS slot data
 - Query live AMS inventory with resolved Bambu/Orca filament profile paths via `get_printer_filaments`
 - List, upload, and delete files on the printer's SD card via FTPS
-- Capture a JPEG snapshot from the chamber camera (TCP-on-6000 path; A1 / P1 series only — see `camera_snapshot` for status)
+- Capture a JPEG snapshot from the chamber camera. Supports A1, A1 mini, P1S, P1P (TCP-on-6000), and X1, X1C, X1E, P2S, H2, H2S, H2D, H2C, H2D Pro (RTSP via ffmpeg). Requires ffmpeg in PATH for the RTSP path.
 - Upload and print pre-sliced `.gcode.3mf` files with full plate selection and calibration flag control (recommended path — see [docs/SLICING.md](./docs/SLICING.md))
 - Optional auto-slice path via BambuStudio CLI. Set `BAMBU_CLI_FLATTEN=true` to enable a workaround that flattens BBL profile inheritance before invoking the CLI — works around upstream bugs in BambuStudio CLI mode ([#9636](https://github.com/bambulab/BambuStudio/issues/9636), [#9968](https://github.com/bambulab/BambuStudio/issues/9968)). Verified on H2S/H2D/X1C/P1S. Default off; Path A (GUI-slice) remains the recommended workflow for non-BBL profiles or first-time prints. See [docs/SLICING.md](./docs/SLICING.md).
 - Parse AMS mapping from the 3MF's embedded slicer metadata (`Metadata/plate_<n>.json` + gcode filament header) and send it correctly formatted per the OpenBambuAPI spec
@@ -683,34 +683,25 @@ List files stored on the printer's SD card. Scans the `cache/`, `timelapse/`, an
 
 Capture a single JPEG frame from the printer's chamber camera. Read-only.
 
-**Supported on this code path:** A1, A1 mini, P1S, P1P. Wire protocol per [OpenBambuAPI/video.md](https://github.com/Doridian/OpenBambuAPI/blob/main/video.md): TLS on port 6000, 80-byte auth packet (`bblp` + access token), repeating 16-byte frame header + JPEG payload.
+Two transports are wired in, picked by `bambu_model`:
 
-**Not yet supported by default:**
-- **X1 / X1 Carbon / X1E / P2S** — these use RTSP on port 322 (`rtsps://bblp:<token>@<host>:322/streaming/live/1`). Tool returns a clear error pointing at the URL until RTSP support lands.
-- **H2 / H2S / H2D** — wire protocol not documented upstream. Default behavior is to refuse rather than guess. Pass `experimental: true` to try the A1/P1 TCP-on-6000 path against H2 hardware anyway. Read-only either way: if the auth/format isn't right you'll get a clean error rather than a frame, and no data is exfiltrated. If experimental mode returns a JPEG on your H2, please share the result — that's how we promote H2 out of the experimental bucket. Track [video.md](https://github.com/Doridian/OpenBambuAPI/blob/main/video.md) for upstream documentation.
+- **TCP-on-6000** for **A1, A1 mini, P1S, P1P**. Native protocol per [OpenBambuAPI/video.md](https://github.com/Doridian/OpenBambuAPI/blob/main/video.md): TLS on port 6000, 80-byte auth packet (`bblp` + access token), repeating 16-byte frame header + JPEG payload.
+- **RTSP** for **X1, X1 Carbon, X1E, P2S** and **H2, H2S, H2D, H2C, H2D Pro**. Shells out to ffmpeg with `rtsps://bblp:<token>@<host>:322/streaming/live/1 -frames:v 1`. The H2 series wasn't documented in OpenBambuAPI's `video.md` but its firmware uses the same RTSP endpoint as X1 (verified live against an H2S, 2026-04-27).
+
+**Requires ffmpeg in PATH** for the RTSP path. Install with `brew install ffmpeg` on macOS. Override the binary location with the `ffmpeg_path` tool argument if it lives elsewhere. The TCP-on-6000 path uses native Node TLS and does not require ffmpeg.
 
 ```json
 {
   "save_path": "/tmp/snap.jpg",
   "timeout_ms": 8000,
-  "bambu_model": "p1s",
+  "bambu_model": "h2s",
   "host": "192.168.1.100",
   "bambu_serial": "01P00A123456789",
   "bambu_token": "your_access_token"
 }
 ```
 
-Returns `{ status, format: "image/jpeg", sizeBytes, base64, savedTo?, note? }`. Pass `save_path` to also write the bytes to disk; otherwise only the base64 payload is returned. When `experimental: true` is set against an H2 model, the response includes a `note` field describing the experimental status.
-
-To probe an H2 series printer:
-
-```json
-{
-  "bambu_model": "h2s",
-  "experimental": true,
-  "save_path": "/tmp/h2s-probe.jpg"
-}
-```
+Returns `{ status, format: "image/jpeg", sizeBytes, base64, savedTo?, transport }`. `transport` is `"tcp-6000"` or `"rtsps-322"` so callers can tell which path produced the frame. Pass `save_path` to also write the bytes to disk; otherwise only the base64 payload is returned.
 
 #### delete_printer_file
 

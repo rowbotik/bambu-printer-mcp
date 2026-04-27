@@ -13,5 +13,6 @@ coverage/
 
 # Local credentials and private fixtures (never commit)
 bambu certs/
+bambu-mcp-config.json
 docs/*.gcode.3mf
 docs/mk2 collarID.gcode.3mf.3mf.gcode.3mf

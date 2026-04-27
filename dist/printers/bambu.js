@@ -940,22 +940,37 @@ export class BambuImplementation {
     async cameraSnapshot(host, _serial, token, options = {}) {
         const timeoutMs = options.timeoutMs ?? 8000;
         const model = (options.bambuModel ?? "").toLowerCase();
+        // P1/A1 series still use the proprietary TCP-on-6000 framed JPEG path
+        // (per https://github.com/Doridian/OpenBambuAPI/blob/main/video.md).
         const TCP_CAMERA_MODELS = new Set(["a1", "a1mini", "p1s", "p1p"]);
-        const RTSP_MODELS = new Set(["x1", "x1c", "x1carbon", "x1e", "p2s"]);
-        const UNDOCUMENTED_MODELS = new Set(["h2", "h2s", "h2d"]);
-        let experimentalNote;
-        if (UNDOCUMENTED_MODELS.has(model)) {
-            if (!options.experimental) {
-                throw new Error(`camera_snapshot: H2 series camera protocol is not documented upstream and not yet verified. Refusing to send a guess at the wire format. Pass experimental:true to try the A1/P1 TCP-on-6000 path anyway. Track https://github.com/Doridian/OpenBambuAPI/blob/main/video.md for updates.`);
+        // X1, P2S, AND H2 (H2S/H2D/H2C) all use RTSP on port 322. The
+        // OpenBambuAPI doc only mentions X1/P2S, but the HA bambulab
+        // integration's models.py shows the printer reports its own
+        // `ipcam.rtsp_url` for these models, and Parker (H2S) rejects the
+        // A1/P1 80-byte auth packet on port 6000 (verified 2026-04-27 --
+        // see PROGRESS.md "H2 probe results").
+        const RTSP_MODELS = new Set([
+            "x1", "x1c", "x1carbon", "x1e", "p2s",
+            "h2", "h2s", "h2d", "h2c", "h2dpro",
+        ]);
+        if (RTSP_MODELS.has(model)) {
+            const jpeg = await this.fetchRtspCameraFrame(host, token, timeoutMs, options.ffmpegPath);
+            const result = {
+                status: "success",
+                format: "image/jpeg",
+                sizeBytes: jpeg.length,
+                base64: jpeg.toString("base64"),
+                transport: "rtsps-322",
+            };
+            if (options.savePath) {
+                const fsSync = await import("node:fs");
+                fsSync.writeFileSync(options.savePath, jpeg);
+                result.savedTo = options.savePath;
             }
-            experimentalNote = `Used the A1/P1 TCP-on-6000 wire format against ${model.toUpperCase()} via experimental:true. The H2 protocol is not documented upstream; if this returned a JPEG, please share details so we can promote H2 out of the experimental bucket.`;
-            console.warn(`[camera_snapshot] EXPERIMENTAL: trying A1/P1 TCP-on-6000 path against ${model.toUpperCase()}. Wire format is not verified for this model.`);
+            return result;
         }
-        else if (RTSP_MODELS.has(model)) {
-            throw new Error(`camera_snapshot: ${model.toUpperCase()} uses RTSP on port 322 which is not yet implemented in this MCP. Use OctoEverywhere or rtsps://bblp:<token>@${host}:322/streaming/live/1 directly.`);
-        }
-        else if (model && !TCP_CAMERA_MODELS.has(model)) {
-            throw new Error(`camera_snapshot: model "${model}" is not a known Bambu Lab printer model. Supported on this code path: ${[...TCP_CAMERA_MODELS].join(", ")}`);
+        if (model && !TCP_CAMERA_MODELS.has(model)) {
+            throw new Error(`camera_snapshot: model "${model}" is not a known Bambu Lab printer model. Supported: ${[...TCP_CAMERA_MODELS, ...RTSP_MODELS].sort().join(", ")}`);
         }
         const jpeg = await this.fetchTcpCameraFrame(host, token, timeoutMs);
         const result = {
@@ -963,15 +978,98 @@ export class BambuImplementation {
             format: "image/jpeg",
             sizeBytes: jpeg.length,
             base64: jpeg.toString("base64"),
+            transport: "tcp-6000",
         };
-        if (experimentalNote)
-            result.note = experimentalNote;
         if (options.savePath) {
             const fsSync = await import("node:fs");
             fsSync.writeFileSync(options.savePath, jpeg);
             result.savedTo = options.savePath;
         }
         return result;
+    }
+    /**
+     * Pull a single JPEG frame from the printer's RTSP/RTSPS stream using
+     * ffmpeg. Used for X1, P2S, and H2 series.
+     *
+     * URL pattern verified against HA bambulab's models.py example:
+     *   rtsps://bblp:<access_code>@<host>:322/streaming/live/1
+     *
+     * ffmpeg invocation:
+     *   ffmpeg -rtsp_transport tcp -i <url> -frames:v 1 -f image2 -c:v mjpeg -y <out>
+     *
+     * -rtsp_transport tcp avoids UDP NAT/firewall issues. -frames:v 1
+     * makes ffmpeg exit as soon as one frame lands. -y overwrites the temp
+     * file. The Bambu printer presents a self-signed cert; ffmpeg's TLS
+     * layer accepts that by default (no host verification).
+     */
+    async fetchRtspCameraFrame(host, token, timeoutMs, ffmpegPath) {
+        const fsSync = await import("node:fs");
+        const os = await import("node:os");
+        const pathMod = await import("node:path");
+        const { spawn } = await import("node:child_process");
+        const tmpOut = pathMod.join(os.tmpdir(), `bambu-snap-${Date.now()}-${Math.random().toString(16).slice(2)}.jpg`);
+        const url = `rtsps://bblp:${encodeURIComponent(token)}@${host}:322/streaming/live/1`;
+        const bin = ffmpegPath ?? "ffmpeg";
+        // Note: ffmpeg's `-stimeout` was removed in 8.0 and renamed across the
+        // 5.x/6.x line; we rely on the outer kill timer instead so we don't
+        // have to detect ffmpeg version. -rtsp_transport tcp avoids UDP NAT
+        // headaches; -frames:v 1 makes ffmpeg exit on first frame.
+        const args = [
+            "-rtsp_transport", "tcp",
+            "-i", url,
+            "-frames:v", "1",
+            "-f", "image2",
+            "-c:v", "mjpeg",
+            "-y",
+            "-loglevel", "error",
+            tmpOut,
+        ];
+        return new Promise((resolve, reject) => {
+            let stderr = "";
+            const proc = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+            const killTimer = setTimeout(() => {
+                try {
+                    proc.kill("SIGKILL");
+                }
+                catch { /* ignore */ }
+                reject(new Error(`camera_snapshot: ffmpeg timed out after ${timeoutMs}ms`));
+            }, timeoutMs + 1000);
+            proc.stderr.on("data", (d) => { stderr += d.toString(); });
+            proc.on("error", (err) => {
+                clearTimeout(killTimer);
+                if (err.code === "ENOENT") {
+                    reject(new Error(`camera_snapshot: ffmpeg binary not found at "${bin}". Install with \`brew install ffmpeg\` or pass ffmpegPath.`));
+                }
+                else {
+                    reject(err);
+                }
+            });
+            proc.on("close", (code) => {
+                clearTimeout(killTimer);
+                if (code !== 0) {
+                    // Strip access code from error messages so we don't leak credentials.
+                    const safeStderr = stderr.split(token).join("<token-redacted>").trim();
+                    reject(new Error(`camera_snapshot: ffmpeg exited ${code}. stderr: ${safeStderr.slice(-1000)}`));
+                    try {
+                        fsSync.unlinkSync(tmpOut);
+                    }
+                    catch { /* ignore */ }
+                    return;
+                }
+                try {
+                    const jpeg = fsSync.readFileSync(tmpOut);
+                    fsSync.unlinkSync(tmpOut);
+                    if (jpeg.length < 4 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8) {
+                        reject(new Error("camera_snapshot: ffmpeg produced output that does not start with JPEG SOI"));
+                        return;
+                    }
+                    resolve(jpeg);
+                }
+                catch (err) {
+                    reject(err);
+                }
+            });
+        });
     }
     /**
      * Open the TLS-on-6000 socket, send the 80-byte auth packet, and read
