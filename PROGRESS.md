@@ -22,7 +22,7 @@ b208eac chore: H2 camera probe scripts + diagnostic findings
 
 Verification:
 
-- `npm test` passes: **34/34**.
+- `npm test` passes: **35/35**.
 - BambuStudio CLI slicing smoke passes for H2S, H2D, X1C, and P1S via
   `scripts/test-cli-slice.mjs`; each run produced a sliced 3MF with non-empty
   `Metadata/plate_1.gcode`.
@@ -31,6 +31,11 @@ Verification:
   filament profiles, and `--load-filament-ids` accepted the profiles but still
   produced plate metadata with `filament_ids: [0]`; two-color CLI assignment
   needs more work before claiming support.
+- Local ignored H2D fixture `docs/H2D_barkside_2clr.3mf.gcode.3mf` is a real
+  sliced two-color H2D file: project declares 8 filaments, selected plate uses
+  sparse project positions `[3,4]`, and gcode contains `T3`/`T4` changes.
+  Added a synthetic regression for that metadata shape so `ams_slots: [1,2]`
+  expands to `[-1,-1,-1,1,2,-1,-1,-1]` plus matching `ams_mapping2`.
 - `npm pack --dry-run` passes: 21 files, 150.7 kB package.
 - `npm publish --dry-run --access public` passes for
   `@rowbotik/bambu-printer-mcp@1.1.0`.

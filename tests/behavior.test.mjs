@@ -518,6 +518,52 @@ test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", asyn
   }
 });
 
+test("H2 two-color ams_slots expand at sparse project-level filament positions", async () => {
+  const threeMfPath = await writeSliced3mfFixture({
+    name: "h2d-two-color-project-filament",
+    projectFilamentIds: ["GFG01", "GFG02", "GFG60", "GFG02", "GFG02", "GFG60", "GFG02", "GFL01"],
+    projectFilamentColors: ["#FF911A80", "#39541A", "#F72323", "#000000", "#FFFFFF", "#0D6284", "#000000", "#46A8F9"],
+    projectFilamentTypes: ["PETG", "PETG", "PETG", "PETG", "PETG", "PETG", "PETG", "PLA"],
+    plateFilamentIds: [3, 4],
+  });
+  const bambu = new BambuImplementation();
+  let publishedPayload = null;
+
+  bambu.ftpUpload = async () => {};
+  bambu.getPrinter = async () => ({
+    publish: async (payload) => {
+      publishedPayload = payload;
+    },
+  });
+
+  try {
+    const result = await bambu.print3mf("127.0.0.1", "0938TEST0000000", "TEST_TOKEN", {
+      projectName: "h2d-two-color",
+      filePath: threeMfPath,
+      plateIndex: 0,
+      useAMS: true,
+      amsSlots: [1, 2],
+      bedType: "textured_plate",
+    });
+
+    assert.equal(result.status, "success");
+    assert.ok(publishedPayload?.print, "project_file payload should be published");
+    assert.deepEqual(publishedPayload.print.ams_mapping, [-1, -1, -1, 1, 2, -1, -1, -1]);
+    assert.deepEqual(publishedPayload.print.ams_mapping2, [
+      { ams_id: 255, slot_id: 255 },
+      { ams_id: 255, slot_id: 255 },
+      { ams_id: 255, slot_id: 255 },
+      { ams_id: 0, slot_id: 1 },
+      { ams_id: 0, slot_id: 2 },
+      { ams_id: 255, slot_id: 255 },
+      { ams_id: 255, slot_id: 255 },
+      { ams_id: 255, slot_id: 255 },
+    ]);
+  } finally {
+    fs.rmSync(threeMfPath, { force: true });
+  }
+});
+
 test("camera_snapshot routes H2 series through RTSP (verified live on Parker H2S)", async () => {
   const bambu = new BambuImplementation();
   const fakeJpeg = Buffer.from([0xff, 0xd8, 0x12, 0x34, 0xff, 0xd9]);
