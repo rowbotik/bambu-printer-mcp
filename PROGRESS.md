@@ -19,6 +19,7 @@ Branch: `codex/collar-charm-h2-cleanup`. Committed as `235f224`
 | HMS diagnostics resource | ✅ `printer://{host}/hms` read-only status summary |
 | Light/fan controls | ✅ `set_light` and `set_fan_speed` wrappers; not live-device verified |
 | Skip objects | ✅ object-id lister + `skip_objects` MQTT command; not live-print verified |
+| Upstream comment draft | ✅ saved in `docs/BAMBUSTUDIO-CLI-UPSTREAM-COMMENT.md` |
 | End-to-end on real printer | ⏳ not yet run |
 | Upstream bug report | ⏳ drafted, not posted |
 
@@ -184,8 +185,8 @@ feat: BambuStudio CLI auto-flatten + pause/resume tools
 - **End-to-end test through the actual MCP tool surface.** `slice_stl` via
   MCP stdio is verified with `BAMBU_CLI_FLATTEN=true`; still need a live
   `print_3mf` run against H2S/H2D when it is safe to start a physical print.
-- **Post upstream comment on bambulab/BambuStudio#9636.** Dossier drafted
-  in conversation; needs polish + posting. Includes:
+- **Post upstream comment on bambulab/BambuStudio#9636.** Dossier is saved at
+  `docs/BAMBUSTUDIO-CLI-UPSTREAM-COMMENT.md`; needs posting. Includes:
   - Root-cause walkthrough with line numbers from `BambuStudio.cpp`.
   - Three independent breakages reproduced and resolved.
   - Userland workaround (link to this PR/repo).
