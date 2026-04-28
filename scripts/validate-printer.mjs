@@ -288,9 +288,45 @@ try {
       console.log(`      bed_temp: ${data.temperatures?.bed?.actual ?? "?"}°C (target ${data.temperatures?.bed?.target ?? "?"})`);
       console.log(`      chamber_temp: ${data.temperatures?.chamber ?? "?"}°C`);
       console.log(`      print_progress: ${data.print?.progress ?? "N/A"}`);
-      console.log(`      ams_slots: ${data.ams?.trays?.length ?? 0}`);
+      const amsUnitCount = Array.isArray(data.ams?.ams) ? data.ams.ams.length : 0;
+      console.log(`      ams_units: ${amsUnitCount}`);
+      if (amsUnitCount > 0) {
+        const trayCount = data.ams.ams.reduce((sum, u) => sum + (Array.isArray(u.tray) ? u.tray.length : 0), 0);
+        console.log(`      total_trays: ${trayCount}`);
+      }
     } catch {
       console.log(`      (raw): ${result.slice(0, 200)}`);
+    }
+  });
+
+  console.log("\n8. get_printer_filaments (AMS inventory)");
+  await runTest("get_printer_filaments → loaded trays", async () => {
+    const resp = await send("tools/call", {
+      name: "get_printer_filaments",
+      arguments: {
+        host,
+        bambu_serial: serial,
+        bambu_token: token,
+        bambu_model: model || "h2s",
+      },
+    });
+    if (resp.error) throw new Error(`get_printer_filaments error: ${JSON.stringify(resp.error)}`);
+    const result = resp.result?.content?.[0]?.text ?? "";
+    if (!result) throw new Error("Empty response from get_printer_filaments");
+    const data = JSON.parse(result);
+    console.log(`      loaded_slots: ${data.summary?.loaded_slots ?? 0}`);
+    console.log(`      resolved_profiles: ${data.summary?.resolved_profile_slots ?? 0}`);
+    console.log(`      empty_slots: ${data.summary?.empty_slots ?? 0}`);
+    console.log(`      current_slot: ${data.summary?.current_slot ?? "none"}`);
+    if (Array.isArray(data.trays)) {
+      for (const t of data.trays.slice(0, 4)) {
+        console.log(`      tray slot=${t.slot} loaded=${t.loaded} type=${t.tray_type} profile=${t.resolved_base_profile_name ?? "?"}`);
+      }
+    }
+    // Accept "no AMS" as a valid printer state (the printer may simply have
+    // no AMS unit connected).
+    if ((data.summary?.loaded_slots ?? 0) === 0 && (data.summary?.empty_slots ?? 0) === 0) {
+      console.log(`      (no AMS data — printer may have no AMS unit connected)`);
     }
   });
 } finally {

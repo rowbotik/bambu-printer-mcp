@@ -878,7 +878,17 @@ class BambuPrinterMCPServer {
     nozzleDiameter?: string
   ): Promise<PrinterFilamentInventory> {
     const status = await this.bambu.getStatus(host, bambuSerial, bambuToken);
-    return normalizePrinterFilamentInventory(status, bambuModel, nozzleDiameter);
+    let inventory = normalizePrinterFilamentInventory(status, bambuModel, nozzleDiameter);
+    // The first MQTT push from an idle printer is sparse (model/modules
+    // only). AMS data arrives on a second push a short while later. If
+    // we have a live connection but no loaded trays, wait for the follow-
+    // up push and retry.
+    if (inventory.trays.length === 0 && status.connected) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const retryStatus = await this.bambu.getStatus(host, bambuSerial, bambuToken);
+      inventory = normalizePrinterFilamentInventory(retryStatus, bambuModel, nozzleDiameter);
+    }
+    return inventory;
   }
 
   private async inspectSliceSettings(sourcePath: string) {

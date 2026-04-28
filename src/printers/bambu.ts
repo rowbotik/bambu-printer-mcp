@@ -279,23 +279,29 @@ class BambuClientStore {
   ): Promise<Record<string, any> | null> {
     const key = getPrinterKey(host, serial, token);
     const existing = this.reportSnapshots.get(key);
-    if (existing && Object.keys(existing).length > 0) {
-      return existing;
+
+    if (!existing || Object.keys(existing).length === 0) {
+      // No MQTT data yet — wait for the first push.
+      const reportPromise = this.ensureInitialReportPromise(key);
+      try {
+        await Promise.race([
+          reportPromise,
+          sleep(timeoutMs).then(() => {
+            throw new Error(`Timed out waiting for initial printer report after ${timeoutMs}ms.`);
+          }),
+        ]);
+      } catch (error) {
+        console.warn(`No initial printer report received for ${serial}:`, error);
+      }
     }
 
-    const reportPromise = this.ensureInitialReportPromise(key);
-
-    try {
-      await Promise.race([
-        reportPromise,
-        sleep(timeoutMs).then(() => {
-          throw new Error(`Timed out waiting for initial printer report after ${timeoutMs}ms.`);
-        }),
-      ]);
-    } catch (error) {
-      console.warn(`No initial printer report received for ${serial}:`, error);
-    }
-
+    // Short settle: the first MQTT push from the printer is a sparse "hello"
+    // with only model/modules. A second push carrying the full status
+    // (gcode_state, ams, hms, temperatures, fans, etc.) arrives afterward
+    // and gets merged into reportSnapshots via incremental update.
+    // This settle runs regardless of whether data arrived before or during
+    // the promise race above, so the merge has time to complete.
+    await sleep(500);
     return this.reportSnapshots.get(key) || null;
   }
 

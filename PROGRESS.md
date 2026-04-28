@@ -24,9 +24,10 @@ Last updated: 2026-04-28 17:00 ET.
 | P3 | Codex | Implemented / physical AMS validation required | AMS RFID reread | Only run with explicit user approval; select AMS/slot, observe any AMS movement, then verify inventory refresh | `reread_ams_rfid` refreshes the expected slot and does not disturb print state |
 | P3 | Codex | Implemented / active-print validation required | Skip objects | During a user-approved test print with known object IDs, call `list_3mf_plate_objects`, then `skip_objects` for a harmless object | Printer skips only the requested object(s); command shape verified against firmware |
 | P3 | Codex | Done | Better AMS inventory reporting | Added summary counts, display labels, profile resolution confidence, recommended `load_filaments`, README docs; `npm test` 35/35 | Output is easier to use for `auto_match_ams` decisions without reading raw status |
+| P3 | Codex | Done | AMS settle-time retry in get_printer_filaments | Added 1.5s retry in `getResolvedPrinterFilamentInventory()` when no trays are found on first `getStatus()` call — matches the HMS resource retry pattern. Validated on Parker H2S (4 loaded trays, profiles resolved) and Kingpin H2D (no AMS connected — accepted gracefully). | `get_printer_filaments` returns live AMS data on first call (even when the second MQTT push hasn't arrived within the 500ms settle window) |
 | P3 | User + Codex | Parked | Physical print validation | Do not start prints or move hardware unless the user explicitly asks | Any print test has explicit user approval and plate/material context |
 
-Immediate next recommended action: All idle-printer P3 items validated on both Parker H2S and Kingpin H2D. Remaining P3 items: AMS RFID reread (physical movement, needs user approval), print speed mode (during active print), skip objects (during active print). First is ready to discuss; others need a test print.
+Immediate next recommended action: AMS settle-time fix validated — `get_printer_filaments` now retries when trays are empty. Remaining P3 items: AMS RFID reread (physical movement, needs user approval), print speed mode (during active print), skip objects (during active print). All idle-printer validations done.
 
 ### DeepSeek Sidecar Lane
 
