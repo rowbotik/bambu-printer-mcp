@@ -52,6 +52,8 @@ configuration parsing succeeds. Same family as upstream
 H2D multi-color CLI path appears to have additional segfault sites
 beyond the ones PR #9941 fixed.
 
+**Filed upstream:** [bambulab/BambuStudio#10408](https://github.com/bambulab/BambuStudio/issues/10408) (2026-04-27).
+
 **Confirmed upstream-only via two-cube minimal repro:** swapped the
 bunny STLs for two trivial 8-vertex cubes (built inline in
 `scripts/two-cubes.mjs` style), kept everything else identical.
