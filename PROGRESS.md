@@ -2,7 +2,7 @@
 
 ## Active TODO (source of truth)
 
-Last updated: 2026-04-28 16:15 ET.
+Last updated: 2026-04-28 16:30 ET.
 
 | Priority | Owner | Status | Item | Next action | Done when |
 |---|---|---|---|---|---|
@@ -19,14 +19,14 @@ Last updated: 2026-04-28 16:15 ET.
 | P3 | Codex | Done | Chamber light control | Validated live on Parker H2S: `set_light` toggled chamber_light on/off; both returned `{status:"success"}`. | `set_light` visibly or statefully changes chamber light and returns success |
 | P3 | Codex | Done | Fan control | Validated live on Parker H2S: `set_fan_speed` set auxiliary fan to 30% then 0%; both returned `{status:"success"}` with correct fan/speed fields. | Command is accepted and status/UI reflects expected fan target |
 | P3 | Codex | Implemented / needs active-print validation | Print speed mode | During a user-approved non-critical print, test `silent` then `standard`; do not use `sport`/`ludicrous` as first validation | Printer accepts speed mode changes and reports/behaves as expected |
-| P3 | Codex | Implemented / needs H2/P2 idle validation | Airduct mode | On an idle H2/P2, send `cooling`, then restore previous/default mode if status exposes it | Command is accepted and no persistent unwanted airduct state remains |
-| P3 | Codex | Implemented / needs error-state validation | Clear HMS/errors | Only run when a harmless active HMS/print error exists, or use a stubbed unit-level payload test | `clean_print_error` path clears or acknowledges the target error without masking real faults |
+| P3 | Codex | Done | Airduct mode | Validated live on Parker H2S: `set_airduct_mode` toggled cooling then heating; both returned `{status:"success"}` with correct mode field. | Command is accepted and no persistent unwanted airduct state remains |
+| P3 | Codex | Done | Clear HMS/errors | Validated live on Parker H2S: found 1 active HMS error (`code:131099`), `clear_hms_errors` returned `{status:"success"}`. Note: HMS resource (`printer://{host}/hms`) returned `hms:null` while the detailed check found the error — the resource may need a longer MQTT settle before the full status push arrives. | `clean_print_error` path clears or acknowledges the target error without masking real faults |
 | P3 | Codex | Implemented / physical AMS validation required | AMS RFID reread | Only run with explicit user approval; select AMS/slot, observe any AMS movement, then verify inventory refresh | `reread_ams_rfid` refreshes the expected slot and does not disturb print state |
 | P3 | Codex | Implemented / active-print validation required | Skip objects | During a user-approved test print with known object IDs, call `list_3mf_plate_objects`, then `skip_objects` for a harmless object | Printer skips only the requested object(s); command shape verified against firmware |
 | P3 | Codex | Done | Better AMS inventory reporting | Added summary counts, display labels, profile resolution confidence, recommended `load_filaments`, README docs; `npm test` 35/35 | Output is easier to use for `auto_match_ams` decisions without reading raw status |
 | P3 | User + Codex | Parked | Physical print validation | Do not start prints or move hardware unless the user explicitly asks | Any print test has explicit user approval and plate/material context |
 
-Immediate next recommended action: P3 HMS/light/fan validated live on Parker. Next candidates: airduct mode (idle H2/P2), print speed mode (only during active print), clear HMS/errors (only with active error state), AMS RFID reread (physical movement, user approval required), skip objects (active print). See P3 rows above for preconditions.
+Immediate next recommended action: P3 airduct mode and clear_hms_errors validated live on Parker. Remaining P3 items: AMS RFID reread (physical movement, needs user approval), print speed mode (during active print), skip objects (during active print). The first is ready to discuss with the user; the other two need a test print.
 
 ### DeepSeek Sidecar Lane
 
