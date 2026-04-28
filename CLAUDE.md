@@ -5,6 +5,13 @@
 - **Always bump the npm version** (`npm version patch`) and `npm publish` after any change that gets pushed to main -- code, docs, config, anything.
 - Commit the version bump and push it as part of the same push.
 
+## Changelog
+
+- **Every commit that changes src/, scripts/, or printer behavior must include a CHANGELOG.md entry** under the `## Unreleased` heading.
+- Entries go under the appropriate subsection (`### Added`, `### Fixed`, `### Changed`, `### Removed`, `### Known issues`).
+- Each entry is a bullet describing what changed and why, in present tense. Include PR/issue links when relevant.
+- If the commit is a standalone CHANGELOG update (e.g. retroactive entry for a prior commit), the commit message should start with `docs(changelog):`.
+
 ## Build & Test
 
 - `npm run build` must pass clean (zero tsc errors) before committing.
