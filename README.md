@@ -11,9 +11,36 @@ A Bambu Lab-focused MCP server for controlling Bambu printers, manipulating STL 
 
 This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server). All OctoPrint, Klipper, Duet, Repetier, Prusa Connect, and Creality Cloud support has been removed. What remains is a focused, lean implementation for Bambu Lab hardware.
 
-**What's different in this fork:** Significant expansion of printer control surfaces beyond the upstream — AMS auto-matching with RFID (`auto_match_ams`), multi-object skip (`skip_objects`), chamber camera snapshot (`camera_snapshot`), HMS diagnostics, advanced temperature and fan control, H2/H2D airduct mode, AMS RFID re-read, **AMS dryer control**, pause/resume, speed mode switching, and a structured AMS filament inventory with profile resolution. The complete [Bambuddy](https://github.com/maziggy/bambuddy)-inspired feature set is ported. All H2S/H2D-specific MQTT and FTP protocol quirks are handled (see [Bambu Communication Notes](#bambu-communication-notes-mqtt-and-ftp)).
-
 Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the custom H2D/H2S patches, per-printer MCP split, and remote deployment plan used in this clone.
+
+---
+
+## What's new in @rowbotik/bambu-printer-mcp
+
+This fork adds a substantial set of printer control tools beyond the upstream `mcp-3D-printer-server`. Everything listed below is unique to this package.
+
+### v1.1.0 — AMS auto-match, camera snapshot, pause/resume, skip objects
+
+- **AMS auto-match by RFID** (`auto_match_ams` on `print_3mf`) — resolves sliced 3MF filament requirements against live AMS inventory. Handles same-SKU different-color filaments. Dry-run with `resolve_3mf_ams_slots`.
+- **Structured AMS inventory** (`get_printer_filaments`) — per-tray display names, profile resolution tier (`exact-model-nozzle`/`model`/`generic`/`unresolved`), match confidence, and a summary with recommended auto-slice filament.
+- **AMS settle-time retry** — transparently retries when AMS data hasn't arrived on the first MQTT push from an idle printer.
+- **Camera snapshot** (`camera_snapshot`) — JPEG from the chamber camera. TCP-on-6000 for A1/P1S/P1P, RTSP via ffmpeg for X1/P2S/H2 series.
+- **Pause / resume** (`pause_print`, `resume_print`) — alongside the existing `cancel_print`.
+- **Skip objects** (`skip_objects`) — skip specific object IDs during a running multi-object print. IDs from `list_3mf_plate_objects`.
+- **HMS diagnostics** (`printer://{host}/hms` MCP resource) — read-only error summary with automatic settle retry.
+- **Utility controls** — `set_print_speed` (silent/standard/sport/ludicrous), `clear_hms_errors`, `reread_ams_rfid`, `set_airduct_mode` (cooling/heating for H2/P2).
+- **H2/H2D-safe print path** — correct `project_file` format with `ams_mapping2` parallel array, H2 firmware quirks handled.
+- **BambuStudio CLI auto-flatten** (`BAMBU_CLI_FLATTEN=true`) — works around upstream profile inheritance bugs.
+- **Print collar charm** (`print_collar_charm`) — specialized two-color wrapper with fixed tray policy.
+
+### v1.1.1 — AMS dryer control (current)
+
+- **AMS dryer start/stop** (`set_ams_drying`) — sends `print.ams_control` MQTT command. Works on heated AMS units (AMS Pro / AMS-HT). Action: `start` or `stop`, target by AMS index 0–3.
+- Same-SKU different-color fix for `auto_match_ams`.
+- AMS and HMS settle-time retry for idle printers.
+- Validation script (`scripts/validate-printer.mjs`) for live printer testing.
+
+> Full changelog at [CHANGELOG.md](./CHANGELOG.md).
 
 <details>
 <summary><strong>Click to expand Table of Contents</strong></summary>
