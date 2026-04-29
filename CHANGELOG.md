@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [1.1.1] – 2026-04-29
+
 ### Fixed
 - **`auto_match_ams` now handles same-SKU different-color filaments.** Previously the matcher keyed only on `tray_info_idx`, so a 3MF needing two GFG02 (PETG HF) trays — one black, one white — would error out as "could not find loaded AMS trays for: GFG02, GFG02" even when both were present. The matcher now joins on `(tray_info_idx, tray_color)` (RGB-normalized; alpha bytes ignored) and tracks already-claimed slots so two requirements can't collapse onto the same physical slot. Falls back to SKU-only matching when the 3MF carries no color or only one tray of that SKU is loaded. Returns a structured `missing` report with reasons (`no_loaded_match` / `color_mismatch` / `exhausted` / `no_sku`) when resolution fails.
 - **`get_printer_filaments` retries when AMS data hasn't arrived yet.** The first MQTT push from an idle printer is sparse (model/modules only); AMS data arrives on a second push that often misses the 500ms settle window in `waitForInitialReport()`. Adds a 1.5s retry in `getResolvedPrinterFilamentInventory()` when trays are empty, matching the same retry pattern already used by the HMS resource handler. Validated on Parker H2S (4 loaded trays, all profiles resolved) and Kingpin H2D (no AMS connected — accepted gracefully).
@@ -47,3 +49,7 @@
 ## [1.0.5] – prior release
 
 Initial public release with core print, upload, slice, and status tooling.
+
+[1.1.1]: https://github.com/rowbotik/bambu-printer-mcp/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/rowbotik/bambu-printer-mcp/compare/v1.0.5...v1.1.0
+[1.0.5]: https://github.com/rowbotik/bambu-printer-mcp/releases/tag/v1.0.5
