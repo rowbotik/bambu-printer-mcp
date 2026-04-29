@@ -18,16 +18,17 @@ Last updated: 2026-04-28 17:00 ET.
 | P3 | Codex | Done | HMS diagnostics resource | Validated live on Parker H2S and Kingpin H2D: MQTT connected, returned structured response. Resource now includes 1.5s settle-and-retry for the incremental HMS status push. Both printers showed `hms_errors: 1` (`code:131099`). | Resource returns current state plus HMS/error/warning fields without throwing |
 | P3 | Codex | Done | Chamber light control | Validated live on Parker H2S and Kingpin H2D: `set_light` toggled chamber_light on/off; both returned `{status:"success"}`. | `set_light` visibly or statefully changes chamber light and returns success |
 | P3 | Codex | Done | Fan control | Validated live on Parker H2S and Kingpin H2D: `set_fan_speed` set auxiliary fan to 30% then 0%; both returned `{status:"success"}` with correct fan/speed fields. | Command is accepted and status/UI reflects expected fan target |
-| P3 | Codex | Implemented / needs active-print validation | Print speed mode | During a user-approved non-critical print, test `silent` then `standard`; do not use `sport`/`ludicrous` as first validation | Printer accepts speed mode changes and reports/behaves as expected |
+| P3 | Codex | Done | Print speed mode | Validated on Kingpin H2D during active print: `set_print_speed silent` then `standard` — both returned `{status:"success"}` with correct mode/label. | Printer accepts speed mode changes and reports/behaves as expected |
 | P3 | Codex | Done | Airduct mode | Validated live on Parker H2S and Kingpin H2D: `set_airduct_mode` toggled cooling then heating; both returned `{status:"success"}` with correct mode field. | Command is accepted and no persistent unwanted airduct state remains |
 | P3 | Codex | Done | Clear HMS/errors | Validated live on Parker H2S and Kingpin H2D: found 1 active HMS error (`code:131099`) on each, `clear_hms_errors` returned `{status:"success"}`. Resource now has 1.5s settle-and-retry to catch incremental HMS push. | `clean_print_error` path clears or acknowledges the target error without masking real faults |
 | P3 | Codex | Implemented / physical AMS validation required | AMS RFID reread | Only run with explicit user approval; select AMS/slot, observe any AMS movement, then verify inventory refresh | `reread_ams_rfid` refreshes the expected slot and does not disturb print state |
+| P3 | Codex | Implemented / physical AMS validation required | AMS dryer control | `set_ams_drying` tool sends `print.ams_control` MQTT command with start/stop. Live-print validation needed on heated AMS unit (AMS Pro / AMS-HT). 27/28 tests pass (1 sandbox-restricted streamable-http test). | Tool registered, validates input, produces correct command payload; printer/firmware acceptance unverified |
 | P3 | Codex | Implemented / active-print validation required | Skip objects | During a user-approved test print with known object IDs, call `list_3mf_plate_objects`, then `skip_objects` for a harmless object | Printer skips only the requested object(s); command shape verified against firmware |
 | P3 | Codex | Done | Better AMS inventory reporting | Added summary counts, display labels, profile resolution confidence, recommended `load_filaments`, README docs; `npm test` 35/35 | Output is easier to use for `auto_match_ams` decisions without reading raw status |
 | P3 | Codex | Done | AMS settle-time retry in get_printer_filaments | Added 1.5s retry in `getResolvedPrinterFilamentInventory()` when no trays are found on first `getStatus()` call — matches the HMS resource retry pattern. Validated on Parker H2S (4 loaded trays, profiles resolved) and Kingpin H2D (no AMS connected — accepted gracefully). | `get_printer_filaments` returns live AMS data on first call (even when the second MQTT push hasn't arrived within the 500ms settle window) |
 | P3 | User + Codex | Parked | Physical print validation | Do not start prints or move hardware unless the user explicitly asks | Any print test has explicit user approval and plate/material context |
 
-Immediate next recommended action: AMS settle-time fix validated — `get_printer_filaments` now retries when trays are empty. Remaining P3 items: AMS RFID reread (physical movement, needs user approval), print speed mode (during active print), skip objects (during active print). All idle-printer validations done.
+Immediate next recommended action: AMS settle-time fix validated — `get_printer_filaments` now retries when trays are empty. AMS dryer control implemented (`set_ams_drying`), needs physical validation on heated AMS unit. Remaining P3 items: AMS RFID reread (physical movement, needs user approval), AMS dryer (needs heated AMS for physical testing). All idle-printer validations done.
 
 ### DeepSeek Sidecar Lane
 
@@ -750,7 +751,8 @@ feat: BambuStudio CLI auto-flatten + pause/resume tools
   `resolve_3mf_ams_slots` dry run plus opt-in `print_3mf auto_match_ams`.
   Still needs live H2S/H2D print validation before calling it production-safe.
 - **Future versions:** ✅ AMS RFID re-read tool and airduct control are
-  implemented as MCP command surfaces. AMS dryer start/stop remains future work.
+  implemented as MCP command surfaces. ✅ AMS dryer start/stop is implemented
+  as `set_ams_drying` tool (needs physical validation on heated AMS unit).
   RFID re-read can move AMS filament and needs live validation when physical
   testing is allowed.
 - **HMS error resource:** ✅ `printer://{host}/hms` is implemented as a

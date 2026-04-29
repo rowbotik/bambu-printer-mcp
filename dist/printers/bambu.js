@@ -815,6 +815,34 @@ export class BambuImplementation {
             mode: normalizedMode,
         };
     }
+    async setAmsDrying(host, serial, token, action, amsId) {
+        const printer = await this.getPrinter(host, serial, token);
+        const normalizedAction = action.trim().toLowerCase();
+        if (normalizedAction !== "start" && normalizedAction !== "stop") {
+            throw new Error("AMS drying action must be one of: start, stop.");
+        }
+        const normalizedAmsId = Math.trunc(amsId);
+        if (!Number.isInteger(normalizedAmsId) || normalizedAmsId < 0 || normalizedAmsId > 3) {
+            throw new Error("ams_id must be an integer from 0 to 3.");
+        }
+        const param = normalizedAction === "start" ? "start_drying" : "stop_drying";
+        await printer.publish({
+            print: {
+                command: "ams_control",
+                ams_id: normalizedAmsId,
+                param,
+                sequence_id: "0",
+            },
+        });
+        await sleep(COMMAND_SETTLE_MS);
+        const label = normalizedAction === "start" ? "started" : "stopped";
+        return {
+            status: "success",
+            message: `AMS drying ${label} for AMS ${normalizedAmsId}.`,
+            action: normalizedAction,
+            ams_id: normalizedAmsId,
+        };
+    }
     async skipObjects(host, serial, token, objectIds) {
         const printer = await this.getPrinter(host, serial, token);
         const normalizedObjectIds = objectIds

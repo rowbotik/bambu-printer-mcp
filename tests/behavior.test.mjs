@@ -736,6 +736,92 @@ test("delete_printer_file accepts explicit timelapse/ and logs/ paths", async ()
   assert.deepEqual(calls, ["/timelapse/2026-04-26_12-00.mp4", "/logs/printer.log"]);
 });
 
+test("set_ams_drying rejects invalid action values", async () => {
+  const bambu = new BambuImplementation();
+  bambu.getPrinter = async () => ({
+    publish: async () => {},
+  });
+
+  await assert.rejects(
+    bambu.setAmsDrying("127.0.0.1", "SERIAL", "TOKEN", "toggle", 0),
+    /must be one of: start, stop/i
+  );
+  await assert.rejects(
+    bambu.setAmsDrying("127.0.0.1", "SERIAL", "TOKEN", "", 0),
+    /must be one of: start, stop/i
+  );
+});
+
+test("set_ams_drying rejects invalid ams_id values", async () => {
+  const bambu = new BambuImplementation();
+  bambu.getPrinter = async () => ({
+    publish: async () => {},
+  });
+
+  await assert.rejects(
+    bambu.setAmsDrying("127.0.0.1", "SERIAL", "TOKEN", "start", -1),
+    /must be an integer from 0 to 3/i
+  );
+  await assert.rejects(
+    bambu.setAmsDrying("127.0.0.1", "SERIAL", "TOKEN", "start", 4),
+    /must be an integer from 0 to 3/i
+  );
+  await assert.rejects(
+    bambu.setAmsDrying("127.0.0.1", "SERIAL", "TOKEN", "start", -999),
+    /must be an integer from 0 to 3/i
+  );
+});
+
+test("set_ams_drying sends correct MQTT command for start", async () => {
+  const bambu = new BambuImplementation();
+  let publishPayload = null;
+  bambu.getPrinter = async () => ({
+    publish: async (payload) => {
+      publishPayload = payload;
+    },
+  });
+
+  const result = await bambu.setAmsDrying("127.0.0.1", "SERIAL", "TOKEN", "start", 1);
+
+  assert.deepEqual(publishPayload, {
+    print: {
+      command: "ams_control",
+      ams_id: 1,
+      param: "start_drying",
+      sequence_id: "0",
+    },
+  });
+  assert.equal(result.status, "success");
+  assert.equal(result.action, "start");
+  assert.equal(result.ams_id, 1);
+  assert.match(result.message, /started.*AMS 1/i);
+});
+
+test("set_ams_drying sends correct MQTT command for stop", async () => {
+  const bambu = new BambuImplementation();
+  let publishPayload = null;
+  bambu.getPrinter = async () => ({
+    publish: async (payload) => {
+      publishPayload = payload;
+    },
+  });
+
+  const result = await bambu.setAmsDrying("127.0.0.1", "SERIAL", "TOKEN", "stop", 0);
+
+  assert.deepEqual(publishPayload, {
+    print: {
+      command: "ams_control",
+      ams_id: 0,
+      param: "stop_drying",
+      sequence_id: "0",
+    },
+  });
+  assert.equal(result.status, "success");
+  assert.equal(result.action, "stop");
+  assert.equal(result.ams_id, 0);
+  assert.match(result.message, /stopped.*AMS 0/i);
+});
+
 test("stdio transport: initialize, list tools, call success + structured failure", async (t) => {
   const transport = new StdioClientTransport({
     command: process.execPath,

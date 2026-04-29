@@ -11,6 +11,8 @@ A Bambu Lab-focused MCP server for controlling Bambu printers, manipulating STL 
 
 This is a stripped-down, Bambu-only fork of [mcp-3D-printer-server](https://github.com/DMontgomery40/mcp-3D-printer-server). All OctoPrint, Klipper, Duet, Repetier, Prusa Connect, and Creality Cloud support has been removed. What remains is a focused, lean implementation for Bambu Lab hardware.
 
+**What's different in this fork:** Significant expansion of printer control surfaces beyond the upstream — AMS auto-matching with RFID (`auto_match_ams`), multi-object skip (`skip_objects`), chamber camera snapshot (`camera_snapshot`), HMS diagnostics, advanced temperature and fan control, H2/H2D airduct mode, AMS RFID re-read, **AMS dryer control**, pause/resume, speed mode switching, and a structured AMS filament inventory with profile resolution. The complete [Bambuddy](https://github.com/maziggy/bambuddy)-inspired feature set is ported. All H2S/H2D-specific MQTT and FTP protocol quirks are handled (see [Bambu Communication Notes](#bambu-communication-notes-mqtt-and-ftp)).
+
 Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the custom H2D/H2S patches, per-printer MCP split, and remote deployment plan used in this clone.
 
 <details>
@@ -67,17 +69,22 @@ Local handoff note: see [REMOTE-DEPLOYMENT.md](./REMOTE-DEPLOYMENT.md) for the c
 ## Features
 
 - Get detailed printer status: temperatures (nozzle, bed, chamber), print progress, current layer, time remaining, and live AMS slot data
-- Query live AMS inventory with resolved Bambu/Orca filament profile paths via `get_printer_filaments`
+- Query live AMS inventory with resolved Bambu/Orca filament profile paths via `get_printer_filaments`. Includes per-tray display names, match confidence (`high`/`medium`/`low`/`none`), resolution tier (`exact-model-nozzle`/`model`/`generic`/`unresolved`), and a summary with recommended auto-slice filament. Retries automatically when AMS data hasn't arrived yet (common on first MQTT push from idle printers).
 - List, upload, and delete files on the printer's SD card via FTPS
 - Capture a JPEG snapshot from the chamber camera. Supports A1, A1 mini, P1S, P1P (TCP-on-6000), and X1, X1C, X1E, P2S, H2, H2S, H2D, H2C, H2D Pro (RTSP via ffmpeg). Requires ffmpeg in PATH for the RTSP path.
 - Upload and print pre-sliced `.gcode.3mf` files with full plate selection and calibration flag control (recommended path — see [docs/SLICING.md](./docs/SLICING.md))
 - Optional single-color auto-slice path via BambuStudio CLI. Set `BAMBU_CLI_FLATTEN=true` to enable a workaround that flattens BBL profile inheritance before invoking the CLI — works around upstream bugs in BambuStudio CLI mode ([#9636](https://github.com/bambulab/BambuStudio/issues/9636), [#9968](https://github.com/bambulab/BambuStudio/issues/9968)). Single-color smoke is verified on H2S/H2D/X1C/P1S. H2D two-color CLI slicing is blocked upstream ([#10408](https://github.com/bambulab/BambuStudio/issues/10408)); use a GUI-sliced `.gcode.3mf` for that workflow. Default off; Path A (GUI-slice) remains the recommended workflow for non-BBL profiles, multi-color H2D jobs, or first-time prints. See [docs/SLICING.md](./docs/SLICING.md).
-- Parse AMS mapping from the 3MF's embedded slicer metadata (`Metadata/plate_<n>.json` + gcode filament header) and send it correctly formatted per the OpenBambuAPI spec
+- Parse AMS mapping from the 3MF's embedded slicer metadata (`Metadata/plate_<n>.json` + gcode filament header) and send it correctly formatted per the OpenBambuAPI spec, with correct H2S/H2D `ams_mapping2` parallel array format
+- **Auto-match AMS slots by RFID** (`auto_match_ams` flag on `print_3mf`). Resolves required `tray_info_idx` from the sliced 3MF against live AMS inventory. Handles same-SKU different-color filaments by matching on `(tray_info_idx, tray_color)` and tracking already-claimed slots. Dry-run with `resolve_3mf_ams_slots` before printing.
 - Cancel, pause, and resume in-progress print jobs via MQTT
-- Set print speed mode, clear HMS/print errors, trigger AMS RFID re-read, and control H2/P2 airduct mode via MQTT command surfaces
+- Skip specific objects during a running multi-object print via `skip_objects` (use `list_3mf_plate_objects` to find object IDs first)
+- Set print speed mode (`silent`/`standard`/`sport`/`ludicrous`), clear HMS/print errors, trigger AMS RFID re-read, and control H2/P2 airduct mode (`cooling`/`heating`) via MQTT
+- **Start/stop AMS filament drying** (`set_ams_drying`) on heated AMS units (AMS Pro / AMS-HT). Sends `print.ams_control` MQTT command.
 - Set nozzle and bed temperature via G-code dispatch over MQTT
-- Set fan speed and chamber light mode via MQTT
+- Set fan speed (part, auxiliary, chamber) and chamber light mode (on/off/flashing) via MQTT
+- Read HMS (Health Management System) diagnostics as an MCP resource at `printer://{host}/hms` — read-only error summary from the printer, with automatic settle retry
 - Start G-code files already stored on the printer
+- **Collar charm print wrapper** (`print_collar_charm`) — specialized two-color workflow with fixed tray policy for inner (black, AMS 1 slot 1) and outer (white, AMS 2 slot 1) charm parts
 - STL manipulation: scale, rotate, extend base, merge vertices, center at origin, lay flat, and inspect model info
 - Slice STL or 3MF files using BambuStudio, OrcaSlicer, PrusaSlicer, Cura, or Slic3r
 - Inspect slicer settings from a saved 3MF template or extracted profile via `get_slice_settings`
@@ -402,15 +409,35 @@ If you are using the direct-feed spool holder (no AMS attached) or want to bypas
 }
 ```
 
+### Auto-match AMS by RFID
+
+For pre-sliced 3MFs that declare filament types, the `auto_match_ams` flag on `print_3mf` (or the standalone `resolve_3mf_ams_slots` dry-run tool) automatically resolves the required filaments against your live AMS inventory. The matcher works as follows:
+
+1. Reads the required `tray_info_idx` values from the 3MF's `Metadata/slice_info.config` and `Metadata/plate_<n>.json`
+2. Reads your live AMS trays from the printer's MQTT status push
+3. Matches on `(tray_info_idx, tray_color)` — so two filaments of the same SKU but different colors (e.g. two GFG02 PETG HF spools in black and white) resolve to different slots
+4. Tracks already-claimed slots so two requirements can't collapse onto the same physical position
+5. Falls back to SKU-only matching when the 3MF carries no color data or only one tray of that SKU is loaded
+
+If resolution fails, returns a structured `missing` report with per-requirement reasons:
+- `no_loaded_match` — no AMS tray of that SKU is loaded
+- `color_mismatch` — the SKU matches but the loaded color differs
+- `exhausted` — all matching trays are already claimed by other requirements
+- `no_sku` — the 3MF doesn't declare a `tray_info_idx` for this filament
+
+Dry-run with `resolve_3mf_ams_slots` before printing to preview the match without uploading or starting a job.
+
+### AMS settle-time handling
+
+The first MQTT status push from an idle printer is often sparse (model/module info only) — AMS slot data arrives on a second push. The server's filament inventory and HMS handlers both retry after a 1.5-second settle window when the expected data isn't present in the first response. This is transparent to the caller.
+
 ### Checking AMS status
 
-Use `get_printer_status` to see which filaments are currently loaded in each AMS slot, including material type and color data reported by the printer:
+Use `get_printer_filaments` for the parsed, enriched view (profile paths, display names, match confidence) or `get_printer_status` for the raw AMS data from the printer:
 
 ```
 "What filaments are loaded in my AMS right now?"
 ```
-
-The `ams` field in the status response contains the raw AMS data from the printer, including tray information for each slot.
 
 ---
 
@@ -940,6 +967,29 @@ Skip specific object IDs during a running multi-object print. Use `list_3mf_plat
 }
 ```
 
+#### set_ams_drying
+
+Start or stop the AMS filament drying cycle on heated AMS units (AMS Pro / AMS-HT). The `action` parameter accepts `start` or `stop`. The `ams_id` must be an integer from 0 to 3.
+
+```json
+{
+  "action": "start",
+  "ams_id": 0,
+  "host": "192.168.1.100",
+  "bambu_serial": "01P00A123456789",
+  "bambu_token": "your_access_token"
+}
+```
+
+To stop drying:
+
+```json
+{
+  "action": "stop",
+  "ams_id": 0
+}
+```
+
 #### print_3mf
 
 The primary tool for starting a Bambu print. **Recommended input: a pre-sliced `.gcode.3mf` exported from Bambu Studio** — see [docs/SLICING.md](./docs/SLICING.md). This tool handles the complete workflow:
@@ -1235,6 +1285,14 @@ After connecting the MCP server in Claude Desktop or Claude Code, you can ask Cl
 - "Set the chamber fan to 40 percent."
 - "List the object IDs in this sliced 3MF."
 - "Skip object 6495 on the current print."
+- "Start the AMS drying cycle on AMS 0."
+- "Stop drying on AMS 1."
+- "Match the AMS slots for this 3MF against my loaded filaments without printing."
+- "Auto-match AMS slots and print this 3MF."
+- "Take a camera snapshot of the print bed."
+- "Show me the HMS error codes on the printer."
+- "What speed mode is the printer in?"
+- "Set the airduct to cooling mode."
 
 ### Printing 3MF files
 

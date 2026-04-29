@@ -52,6 +52,7 @@ export declare class BambuImplementation {
         light: string;
         mode: string;
     }>;
+    setAmsDrying(host: string, serial: string, token: string, action: string, amsId: number): Promise<any>;
     skipObjects(host: string, serial: string, token: string, objectIds: number[]): Promise<{
         status: string;
         message: string;

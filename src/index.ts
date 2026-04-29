@@ -1748,6 +1748,28 @@ class BambuPrinterMCPServer {
             }
           },
           {
+            name: "set_ams_drying",
+            description: "Start or stop the AMS filament drying cycle. Available on AMS units with heating capability (AMS Pro / AMS-HT). Sends an ams_control MQTT command to the printer.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                action: {
+                  type: "string",
+                  enum: ["start", "stop"],
+                  description: "Whether to start or stop the drying cycle"
+                },
+                ams_id: {
+                  type: "number",
+                  description: "AMS unit index from 0 to 3"
+                },
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              },
+              required: ["action", "ams_id"]
+            }
+          },
+          {
             name: "print_3mf",
             description: "Print a 3MF file on a Bambu Lab printer. Auto-slices if the 3MF has no gcode. IMPORTANT: bambu_model must be specified to ensure safe printer operation.",
             inputSchema: {
@@ -2131,6 +2153,19 @@ class BambuPrinterMCPServer {
               bambuSerial,
               bambuToken,
               args.object_ids.map((id: unknown) => Number(id))
+            );
+            break;
+
+          case "set_ams_drying":
+            if (!args?.action || args?.ams_id === undefined) {
+              throw new Error("Missing required parameters: action and ams_id");
+            }
+            result = await this.bambu.setAmsDrying(
+              host,
+              bambuSerial,
+              bambuToken,
+              String(args.action),
+              Number(args.ams_id)
             );
             break;
 
